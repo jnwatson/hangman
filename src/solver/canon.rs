@@ -1,0 +1,527 @@
+use std::hash::{Hash, Hasher};
+
+/// Canonicalize a set of signatures under simultaneous letter permutation
+/// AND position (column) permutation.
+///
+/// Two signature sets that are isomorphic under any combination of:
+/// - Relabeling letters (e.g., every `a` becomes `x`, every `b` becomes `y`)
+/// - Permuting positions (e.g., swapping column 0 and column 1 in all sigs)
+///
+/// will produce the same canonical form.
+///
+/// For word lengths ≤ 8, all column permutations are tried (exact).
+/// For word lengths > 8, a heuristic approach is used.
+///
+/// Byte value 0 is treated as a fixed "blank" marker (used by the memoized
+/// solver for masked/revealed positions). It is never relabeled.
+#[cfg(test)]
+pub(super) fn canonicalize(sigs: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    if sigs.is_empty() {
+        return vec![];
+    }
+    let k = sigs[0].len();
+    if k == 0 {
+        return vec![vec![]; sigs.len()];
+    }
+
+    if k <= 8 {
+        canonicalize_exact(sigs, k)
+    } else {
+        canonicalize_heuristic(sigs, k)
+    }
+}
+
+/// Compute a 128-bit hash of the canonical form.
+///
+/// Uses a fast heuristic canonicalization for performance.
+/// This may produce slightly more cache entries than exact canonicalization
+/// (missing some position isomorphisms) but is much faster.
+pub(super) fn canonical_hash(sigs: &[Vec<u8>]) -> u128 {
+    if sigs.is_empty() {
+        return 0;
+    }
+    let k = sigs[0].len();
+    if k == 0 {
+        return 0;
+    }
+    canonical_hash_fast(sigs, k)
+}
+
+/// Combined dedup + canonical hash for the hot path.
+///
+/// Returns `(deduped_indices, canonical_hash)`. The deduped indices keep one
+/// representative per unique effective signature. The canonical hash is
+/// computed on the deduped effective signatures (sort→relabel→sort→relabel→hash).
+///
+/// This avoids computing effective signatures twice (once for dedup, once for
+/// hashing).
+pub(super) fn dedup_and_hash(
+    words: &[Vec<u8>],
+    indices: &[usize],
+    masked: u32,
+) -> (Vec<usize>, u128) {
+    if indices.is_empty() {
+        return (vec![], 0);
+    }
+    let k = words[indices[0]].len();
+    if k == 0 {
+        return (indices.to_vec(), 0);
+    }
+
+    if k <= 8 {
+        return dedup_and_hash_small_k(words, indices, masked, k);
+    }
+
+    dedup_and_hash_general(words, indices, masked, k)
+}
+
+/// Specialized path for k ≤ 8: encode each sig as a u64.
+fn dedup_and_hash_small_k(
+    words: &[Vec<u8>],
+    indices: &[usize],
+    masked: u32,
+    k: usize,
+) -> (Vec<usize>, u128) {
+    use crate::game::letter_bit;
+
+    let n = indices.len();
+
+    // Encode each effective sig as u64 (up to 8 bytes).
+    let mut pairs: Vec<(u64, usize)> = Vec::with_capacity(n);
+    for &idx in indices {
+        let word = &words[idx];
+        let mut key = 0u64;
+        for &b in word.iter().take(k) {
+            let eff = if masked & letter_bit(b) != 0 { 0 } else { b };
+            key = key << 8 | u64::from(eff);
+        }
+        pairs.push((key, idx));
+    }
+
+    // Sort by sig key.
+    pairs.sort_unstable();
+
+    // Dedup and collect unique sigs + representative indices.
+    let mut deduped: Vec<usize> = Vec::new();
+    let mut unique_keys: Vec<u64> = Vec::new();
+    for &(key, idx) in &pairs {
+        if unique_keys.last() != Some(&key) {
+            unique_keys.push(key);
+            deduped.push(idx);
+        }
+    }
+
+    if deduped.len() <= 1 {
+        return (deduped, 0);
+    }
+
+    // Canonicalize: decode unique u64 keys into flat buffer, then
+    // relabel → sort → relabel → hash.
+    let m = unique_keys.len();
+    let total = m * k;
+    let mut buf = vec![0u8; total];
+    for (i, &key) in unique_keys.iter().enumerate() {
+        for j in 0..k {
+            buf[i * k + j] = ((key >> (8 * (k - 1 - j))) & 0xFF) as u8;
+        }
+    }
+
+    // Already sorted from dedup step. relabel → sort → relabel.
+    relabel_flat(&mut buf);
+    let mut tmp = vec![0u8; total];
+    let mut sort_idx: Vec<usize> = (0..m).collect();
+    sort_flat_rows(&mut buf, &mut tmp, &mut sort_idx, m, k);
+    relabel_flat(&mut buf);
+
+    (deduped, hash_flat(&buf))
+}
+
+/// General path for k > 8.
+fn dedup_and_hash_general(
+    words: &[Vec<u8>],
+    indices: &[usize],
+    masked: u32,
+    k: usize,
+) -> (Vec<usize>, u128) {
+    use crate::game::letter_bit;
+
+    let n = indices.len();
+    let mut buf = vec![0u8; n * k];
+    for (i, &idx) in indices.iter().enumerate() {
+        let word = &words[idx];
+        let row = &mut buf[i * k..(i + 1) * k];
+        for (j, &b) in word.iter().enumerate() {
+            row[j] = if masked & letter_bit(b) != 0 { 0 } else { b };
+        }
+    }
+
+    // Sort by sig content.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| buf[a * k..(a + 1) * k].cmp(&buf[b * k..(b + 1) * k]));
+
+    // Reorder and dedup.
+    let mut sorted_buf = vec![0u8; n * k];
+    let mut deduped: Vec<usize> = Vec::new();
+    let mut unique_count = 0;
+
+    for (i, &src) in order.iter().enumerate() {
+        let src_row = &buf[src * k..(src + 1) * k];
+        let is_new = i == 0 || src_row != &sorted_buf[(unique_count - 1) * k..unique_count * k];
+        if is_new {
+            sorted_buf[unique_count * k..(unique_count + 1) * k].copy_from_slice(src_row);
+            deduped.push(indices[src]);
+            unique_count += 1;
+        }
+    }
+
+    if deduped.len() <= 1 {
+        return (deduped, 0);
+    }
+
+    let total = unique_count * k;
+    sorted_buf.truncate(total);
+
+    relabel_flat(&mut sorted_buf);
+    let mut tmp = vec![0u8; total];
+    let mut sort_idx: Vec<usize> = (0..unique_count).collect();
+    sort_flat_rows(&mut sorted_buf, &mut tmp, &mut sort_idx, unique_count, k);
+    relabel_flat(&mut sorted_buf);
+
+    (deduped, hash_flat(&sorted_buf))
+}
+
+/// Fast letter-only canonicalization: sort → relabel → sort → relabel → hash.
+/// No column permutation — sacrifices some position isomorphism merging
+/// for much lower per-call cost.
+fn canonical_hash_fast(sigs: &[Vec<u8>], k: usize) -> u128 {
+    let n = sigs.len();
+    let total = n * k;
+    let mut buf = vec![0u8; total];
+
+    for (i, sig) in sigs.iter().enumerate() {
+        buf[i * k..(i + 1) * k].copy_from_slice(sig);
+    }
+
+    let mut tmp = vec![0u8; total];
+    let mut indices: Vec<usize> = (0..n).collect();
+
+    // sort → relabel → sort → relabel (convergence to fixed point)
+    sort_flat_rows(&mut buf, &mut tmp, &mut indices, n, k);
+    relabel_flat(&mut buf);
+    sort_flat_rows(&mut buf, &mut tmp, &mut indices, n, k);
+    relabel_flat(&mut buf);
+
+    hash_flat(&buf)
+}
+
+/// No canonicalization at all — just sort and hash. For measuring baseline.
+#[allow(dead_code)]
+fn canonical_hash_none(sigs: &[Vec<u8>], _k: usize) -> u128 {
+    let mut sorted = sigs.to_vec();
+    sorted.sort();
+    hash_vecs(&sorted)
+}
+
+fn hash_flat(data: &[u8]) -> u128 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    data.hash(&mut hasher);
+    let h1 = hasher.finish();
+
+    let mut hasher2 = std::hash::DefaultHasher::new();
+    h1.hash(&mut hasher2);
+    data.hash(&mut hasher2);
+    let h2 = hasher2.finish();
+
+    u128::from(h1) | (u128::from(h2) << 64)
+}
+
+/// Exact canonicalization: try all k! column permutations, take lex-smallest.
+#[cfg(test)]
+fn canonicalize_exact(sigs: &[Vec<u8>], k: usize) -> Vec<Vec<u8>> {
+    let n = sigs.len();
+    let mut best: Option<Vec<u8>> = None;
+    let mut perm: Vec<usize> = (0..k).collect();
+    let mut buf = vec![0u8; n * k];
+    let mut tmp = vec![0u8; n * k];
+    let mut indices: Vec<usize> = (0..n).collect();
+
+    loop {
+        canonical_for_perm_flat(sigs, &perm, &mut buf, &mut tmp, &mut indices, n, k);
+        if best.as_ref().is_none_or(|b| buf < *b) {
+            best = Some(buf.clone());
+        }
+        if !next_permutation(&mut perm) {
+            break;
+        }
+    }
+
+    let flat = best.unwrap();
+    flat.chunks_exact(k).map(<[u8]>::to_vec).collect()
+}
+
+/// Heuristic canonicalization for large k (> 8).
+///
+/// Sort rows → relabel → sort columns → re-sort → re-relabel.
+/// Not perfect (misses some position isomorphisms) but polynomial.
+#[cfg(test)]
+fn canonicalize_heuristic(sigs: &[Vec<u8>], k: usize) -> Vec<Vec<u8>> {
+    let mut matrix = sigs.to_vec();
+    matrix.sort();
+    matrix = relabel(&matrix);
+
+    // Sort columns by their content vector.
+    let mut col_order: Vec<usize> = (0..k).collect();
+    col_order.sort_by(|&a, &b| {
+        for row in &matrix {
+            let cmp = row[a].cmp(&row[b]);
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+
+    let permuted: Vec<Vec<u8>> = matrix
+        .iter()
+        .map(|row| col_order.iter().map(|&c| row[c]).collect())
+        .collect();
+
+    let mut result = permuted;
+    result.sort();
+    result = relabel(&result);
+    result.sort();
+    result
+}
+
+/// For a fixed column permutation, compute the canonical letter-relabeled form.
+///
+/// sort → relabel → sort → relabel converges to a fixed point where:
+/// - rows are lex-sorted
+/// - letter labels are in first-appearance order (in row-major traversal)
+#[cfg(test)]
+#[allow(dead_code)]
+fn canonical_for_perm(sigs: &[Vec<u8>], perm: &[usize]) -> Vec<Vec<u8>> {
+    let mut matrix: Vec<Vec<u8>> = sigs
+        .iter()
+        .map(|row| perm.iter().map(|&c| row[c]).collect())
+        .collect();
+
+    matrix.sort();
+    matrix = relabel(&matrix);
+    matrix.sort();
+    matrix = relabel(&matrix);
+
+    matrix
+}
+
+/// Flat-buffer version: writes result into `buf` (len = n*k) in row-major order.
+/// `tmp` and `indices` are reusable scratch buffers to avoid allocation.
+#[cfg(test)]
+fn canonical_for_perm_flat(
+    sigs: &[Vec<u8>],
+    perm: &[usize],
+    buf: &mut [u8],
+    tmp: &mut [u8],
+    indices: &mut [usize],
+    n: usize,
+    k: usize,
+) {
+    // Apply column permutation into buf.
+    for (i, sig) in sigs.iter().enumerate() {
+        let row = &mut buf[i * k..(i + 1) * k];
+        for (j, &c) in perm.iter().enumerate() {
+            row[j] = sig[c];
+        }
+    }
+
+    // sort → relabel → sort → relabel (all in-place on buf)
+    sort_flat_rows(buf, tmp, indices, n, k);
+    relabel_flat(buf);
+    sort_flat_rows(buf, tmp, indices, n, k);
+    relabel_flat(buf);
+}
+
+fn sort_flat_rows(buf: &mut [u8], tmp: &mut [u8], indices: &mut [usize], n: usize, k: usize) {
+    for (i, idx) in indices.iter_mut().enumerate() {
+        *idx = i;
+    }
+    indices.sort_by(|&a, &b| buf[a * k..(a + 1) * k].cmp(&buf[b * k..(b + 1) * k]));
+
+    tmp[..n * k].copy_from_slice(&buf[..n * k]);
+    for (dst, &src) in indices.iter().enumerate() {
+        buf[dst * k..(dst + 1) * k].copy_from_slice(&tmp[src * k..(src + 1) * k]);
+    }
+}
+
+/// Relabel non-zero bytes by order of first appearance (row-major), in-place.
+fn relabel_flat(buf: &mut [u8]) {
+    let mut label_map: [u8; 256] = [0; 256];
+    let mut next_id: u8 = 1;
+
+    for &b in buf.iter() {
+        if b != 0 && label_map[b as usize] == 0 {
+            label_map[b as usize] = next_id;
+            next_id += 1;
+        }
+    }
+
+    for b in buf.iter_mut() {
+        if *b != 0 {
+            *b = label_map[*b as usize];
+        }
+    }
+}
+
+/// Relabel non-zero bytes by order of first appearance (row-major).
+#[cfg(test)]
+fn relabel(sigs: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut label_map: [u8; 256] = [0; 256];
+    let mut next_id: u8 = 1;
+
+    for sig in sigs {
+        for &b in sig {
+            if b != 0 && label_map[b as usize] == 0 {
+                label_map[b as usize] = next_id;
+                next_id += 1;
+            }
+        }
+    }
+
+    sigs.iter()
+        .map(|sig| {
+            sig.iter()
+                .map(|&b| if b == 0 { 0 } else { label_map[b as usize] })
+                .collect()
+        })
+        .collect()
+}
+
+fn hash_vecs(data: &[Vec<u8>]) -> u128 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    data.hash(&mut hasher);
+    let h1 = hasher.finish();
+
+    let mut hasher2 = std::hash::DefaultHasher::new();
+    h1.hash(&mut hasher2);
+    data.hash(&mut hasher2);
+    let h2 = hasher2.finish();
+
+    u128::from(h1) | (u128::from(h2) << 64)
+}
+
+/// Advance to the next lexicographic permutation. Returns false if already
+/// at the last permutation.
+#[cfg(test)]
+fn next_permutation(arr: &mut [usize]) -> bool {
+    let n = arr.len();
+    if n <= 1 {
+        return false;
+    }
+
+    let mut i = n - 1;
+    while i > 0 && arr[i - 1] >= arr[i] {
+        i -= 1;
+    }
+    if i == 0 {
+        return false;
+    }
+
+    let mut j = n - 1;
+    while arr[j] <= arr[i - 1] {
+        j -= 1;
+    }
+    arr.swap(i - 1, j);
+    arr[i..].reverse();
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn letter_isomorphic() {
+        let a = vec![b"ab".to_vec(), b"cd".to_vec()];
+        let b = vec![b"ef".to_vec(), b"gh".to_vec()];
+        assert_eq!(canonicalize(&a), canonicalize(&b));
+    }
+
+    #[test]
+    fn position_swap() {
+        let a = vec![b"ab".to_vec(), b"cd".to_vec()];
+        let b = vec![b"ba".to_vec(), b"dc".to_vec()];
+        assert_eq!(canonicalize(&a), canonicalize(&b));
+    }
+
+    #[test]
+    fn position_and_letter_combined() {
+        // {[b,a], [c,a]} ↔ {[a,b], [a,c]} via column swap + letter relabel.
+        // This is the case that the old algorithm got WRONG.
+        let a = vec![b"ba".to_vec(), b"ca".to_vec()];
+        let b = vec![b"ab".to_vec(), b"ac".to_vec()];
+        assert_eq!(canonicalize(&a), canonicalize(&b));
+    }
+
+    #[test]
+    fn non_isomorphic() {
+        // {ab, ac} has shared first letter; {de, fg} does not.
+        let a = vec![b"ab".to_vec(), b"ac".to_vec()];
+        let b = vec![b"de".to_vec(), b"fg".to_vec()];
+        assert_ne!(canonicalize(&a), canonicalize(&b));
+    }
+
+    #[test]
+    fn with_zeros() {
+        let a = vec![vec![0, 1, 2], vec![0, 3, 4]];
+        let b = vec![vec![1, 0, 2], vec![3, 0, 4]];
+        assert_eq!(canonicalize(&a), canonicalize(&b));
+    }
+
+    #[test]
+    fn three_col_rotation() {
+        let a = vec![b"abc".to_vec(), b"def".to_vec()];
+        let b = vec![b"bca".to_vec(), b"efd".to_vec()];
+        let c = vec![b"cab".to_vec(), b"fde".to_vec()];
+        assert_eq!(canonicalize(&a), canonicalize(&b));
+        assert_eq!(canonicalize(&a), canonicalize(&c));
+    }
+
+    #[test]
+    fn hash_isomorphic() {
+        let a = vec![b"ab".to_vec(), b"cd".to_vec()];
+        let b = vec![b"ba".to_vec(), b"dc".to_vec()];
+        assert_eq!(canonical_hash(&a), canonical_hash(&b));
+    }
+
+    #[test]
+    fn hash_position_and_letter_exact() {
+        // canonical_hash uses heuristic (no position isomorphism guaranteed).
+        // This test verifies the exact canonicalize function handles it.
+        let a = vec![b"ba".to_vec(), b"ca".to_vec()];
+        let b = vec![b"ab".to_vec(), b"ac".to_vec()];
+        assert_eq!(canonicalize(&a), canonicalize(&b));
+    }
+
+    #[test]
+    fn empty_sigs() {
+        assert_eq!(canonicalize(&[]), Vec::<Vec<u8>>::new());
+        assert_eq!(canonical_hash(&[]), 0);
+    }
+
+    #[test]
+    fn single_sig() {
+        let a = vec![b"abc".to_vec()];
+        let b = vec![b"xyz".to_vec()];
+        assert_eq!(canonicalize(&a), canonicalize(&b));
+    }
+
+    #[test]
+    fn next_perm_exhaustive() {
+        let mut p = vec![0, 1, 2];
+        let mut count = 1;
+        while next_permutation(&mut p) {
+            count += 1;
+        }
+        assert_eq!(count, 6); // 3! = 6
+    }
+}
