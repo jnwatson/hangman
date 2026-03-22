@@ -72,6 +72,10 @@ pub(super) fn dedup_and_hash(
         return dedup_and_hash_small_k(words, indices, masked, k);
     }
 
+    if k <= 16 {
+        return dedup_and_hash_medium_k(words, indices, masked, k);
+    }
+
     dedup_and_hash_general(words, indices, masked, k)
 }
 
@@ -130,7 +134,62 @@ fn dedup_and_hash_small_k(
     (deduped, canonicalize_sorted_rows(&mut buf, m, k))
 }
 
-/// General path for k > 8.
+/// Specialized path for k=9-16: encode each sig as a u128.
+fn dedup_and_hash_medium_k(
+    words: &[Vec<u8>],
+    indices: &[usize],
+    masked: u32,
+    k: usize,
+) -> (Vec<usize>, u128) {
+    use crate::game::letter_bit;
+
+    let n = indices.len();
+
+    // Encode each effective sig as u128 (up to 16 bytes).
+    let mut pairs: Vec<(u128, usize)> = Vec::with_capacity(n);
+    for &idx in indices {
+        let word = &words[idx];
+        let mut key = 0u128;
+        for &b in word.iter().take(k) {
+            let eff = if masked & letter_bit(b) != 0 { 0 } else { b };
+            key = key << 8 | u128::from(eff);
+        }
+        pairs.push((key, idx));
+    }
+
+    // Sort by sig key.
+    pairs.sort_unstable();
+
+    // Dedup and collect unique sigs + representative indices.
+    let mut deduped: Vec<usize> = Vec::new();
+    let mut unique_keys: Vec<u128> = Vec::new();
+    for &(key, idx) in &pairs {
+        if unique_keys.last() != Some(&key) {
+            unique_keys.push(key);
+            deduped.push(idx);
+        }
+    }
+
+    if deduped.len() <= 1 {
+        return (deduped, 0);
+    }
+
+    // Canonicalize: decode unique u128 keys into flat buffer, then
+    // relabel → sort → relabel → hash.
+    let m = unique_keys.len();
+    let total = m * k;
+    let mut buf = vec![0u8; total];
+    for (i, &key) in unique_keys.iter().enumerate() {
+        for j in 0..k {
+            buf[i * k + j] = ((key >> (8 * (k - 1 - j))) & 0xFF) as u8;
+        }
+    }
+
+    // Rows are already sorted from dedup. Canonicalize with column awareness.
+    (deduped, canonicalize_sorted_rows(&mut buf, m, k))
+}
+
+/// General path for k > 16.
 fn dedup_and_hash_general(
     words: &[Vec<u8>],
     indices: &[usize],
@@ -321,12 +380,19 @@ fn canonicalize_sorted_rows(buf: &mut [u8], m: usize, k: usize) -> u128 {
     }
 
     // Rows already sorted from dedup. Relabel → sort → relabel → hash.
+    // Skip the second sort if relabel didn't change order.
     let total = m * k;
     let mut tmp = vec![0u8; total];
     let mut indices: Vec<usize> = (0..m).collect();
     relabel_flat(buf);
-    sort_flat_rows(buf, &mut tmp, &mut indices, m, k);
-    relabel_flat(buf);
+
+    // Check if still sorted after relabeling.
+    let needs_resort = (1..m).any(|i| buf[(i - 1) * k..i * k] > buf[i * k..(i + 1) * k]);
+    if needs_resort {
+        sort_flat_rows(buf, &mut tmp, &mut indices, m, k);
+        relabel_flat(buf);
+    }
+
     hash_flat(buf)
 }
 
@@ -519,7 +585,36 @@ fn sort_flat_rows(buf: &mut [u8], tmp: &mut [u8], indices: &mut [usize], n: usiz
     for (i, idx) in indices.iter_mut().enumerate() {
         *idx = i;
     }
-    indices.sort_by(|&a, &b| buf[a * k..(a + 1) * k].cmp(&buf[b * k..(b + 1) * k]));
+
+    if k <= 8 {
+        // For short rows, encode each as u64 for O(1) comparison.
+        let mut keys = vec![0u64; n];
+        for i in 0..n {
+            let mut key = 0u64;
+            for &b in &buf[i * k..(i + 1) * k] {
+                key = key << 8 | u64::from(b);
+            }
+            keys[i] = key;
+        }
+        indices.sort_unstable_by_key(|&i| keys[i]);
+    } else {
+        // Hash-accelerated sort: O(1) hash comparison with O(k) tiebreaker.
+        let mut keys = vec![0u64; n];
+        for i in 0..n {
+            let row = &buf[i * k..(i + 1) * k];
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+            for &b in row {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3); // FNV prime
+            }
+            keys[i] = h;
+        }
+        indices.sort_unstable_by(|&a, &b| {
+            keys[a]
+                .cmp(&keys[b])
+                .then_with(|| buf[a * k..(a + 1) * k].cmp(&buf[b * k..(b + 1) * k]))
+        });
+    }
 
     tmp[..n * k].copy_from_slice(&buf[..n * k]);
     for (dst, &src) in indices.iter().enumerate() {
