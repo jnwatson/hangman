@@ -46,6 +46,25 @@ pub struct MemoizedSolver {
 
 const PAR_THRESHOLD: usize = 100;
 
+// Cache entry encoding: bit 31 = lower-bound flag, bits 0..30 = value.
+// Values are always ≤ 25 (at most 26 letters), so this is safe.
+const LOWER_BOUND_BIT: u32 = 1 << 31;
+
+#[inline]
+fn cache_exact(v: u32) -> u32 {
+    v
+}
+
+#[inline]
+fn cache_lower_bound(v: u32) -> u32 {
+    v | LOWER_BOUND_BIT
+}
+
+#[inline]
+fn cache_unpack(packed: u32) -> (u32, bool) {
+    (packed & !LOWER_BOUND_BIT, packed & LOWER_BOUND_BIT != 0)
+}
+
 impl MemoizedSolver {
     #[must_use]
     pub fn new() -> Self {
@@ -66,7 +85,7 @@ impl MemoizedSolver {
         assert!(!words.is_empty());
         let fresh = MemoizedSolverInner::new(words.to_vec());
         let indices: Vec<usize> = (0..words.len()).collect();
-        let result = fresh.solve_subset(&indices, 0);
+        let result = fresh.solve_subset(&indices, 0, u32::MAX);
 
         // Transfer instrumentation to self.
         self.hash_calls.fetch_add(
@@ -77,8 +96,12 @@ impl MemoizedSolver {
             fresh.cache_hits.load(std::sync::atomic::Ordering::Relaxed),
             std::sync::atomic::Ordering::Relaxed,
         );
+        // Only transfer exact values to the outer cache.
         for entry in &fresh.cache {
-            self.cache.insert(*entry.key(), *entry.value());
+            let (_, is_lb) = cache_unpack(*entry.value());
+            if !is_lb {
+                self.cache.insert(*entry.key(), *entry.value());
+            }
         }
 
         result
@@ -228,8 +251,13 @@ impl MemoizedSolverInner {
 
     // ------------------------------------------------------------------
 
-    fn solve_subset(&self, indices: &[usize], masked: LetterSet) -> u32 {
-        if indices.len() <= 1 {
+    /// Solve a subproblem with alpha-beta pruning.
+    ///
+    /// `beta` is an upper bound from the caller: if our value is >= beta, the
+    /// caller will prune, so we can return early. Only exact values (those
+    /// proven < beta) are cached.
+    fn solve_subset(&self, indices: &[usize], masked: LetterSet, beta: u32) -> u32 {
+        if indices.len() <= 1 || beta == 0 {
             return 0;
         }
 
@@ -242,18 +270,27 @@ impl MemoizedSolverInner {
         self.hash_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        if let Some(val) = self.cache.get(&cache_key) {
-            self.cache_hits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return *val;
+        if let Some(packed) = self.cache.get(&cache_key) {
+            let (val, is_lower_bound) = cache_unpack(*packed);
+            if !is_lower_bound {
+                // Exact value — always usable.
+                self.cache_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return val;
+            }
+            if val >= beta {
+                // Lower bound that already meets/exceeds beta — prune.
+                self.cache_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return val;
+            }
+            // Lower bound but val < beta — need to recompute with wider window.
         }
 
-        // Fast path for exactly 2 words: check if any unmasked letter
-        // separates them into distinct hit partitions (0 misses).
-        // Otherwise the answer is 1 (any distinguishing letter costs 1 miss).
+        // Fast path for exactly 2 words.
         if indices.len() == 2 {
             let val = self.solve_two_words(indices[0], indices[1], masked);
-            self.cache.insert(cache_key, val);
+            self.cache.insert(cache_key, cache_exact(val));
             return val;
         }
 
@@ -274,19 +311,42 @@ impl MemoizedSolverInner {
         }
 
         let best = if indices.len() >= PAR_THRESHOLD {
-            self.solve_parallel(&letters, &indices, masked)
+            self.solve_parallel(&letters, &indices, masked, beta)
         } else {
-            self.solve_sequential(&letters, &indices, masked)
+            self.solve_sequential(&letters, &indices, masked, beta)
         };
 
-        self.cache.insert(cache_key, best);
+        if best < beta {
+            // Exact value — all letters evaluated without beta truncation.
+            self.cache.insert(cache_key, cache_exact(best));
+        } else {
+            // Lower bound — store it so future queries with tight beta can prune.
+            // Never overwrite an exact value with a lower bound.
+            let packed = cache_lower_bound(best);
+            if let Some(mut existing) = self.cache.get_mut(&cache_key) {
+                let (old_val, old_is_lb) = cache_unpack(*existing);
+                if old_is_lb && best > old_val {
+                    *existing = packed;
+                }
+                // If exact (!old_is_lb), don't overwrite.
+            } else {
+                self.cache.insert(cache_key, packed);
+            }
+        }
         best
     }
 
-    fn solve_sequential(&self, letters: &[u8], indices: &[usize], masked: LetterSet) -> u32 {
+    fn solve_sequential(
+        &self,
+        letters: &[u8],
+        indices: &[usize],
+        masked: LetterSet,
+        beta: u32,
+    ) -> u32 {
         let mut best = u32::MAX;
         for &letter in letters {
-            let val = self.evaluate_letter(indices, masked, letter, best);
+            let alpha = best.min(beta);
+            let val = self.evaluate_letter(indices, masked, letter, alpha);
             if val < best {
                 best = val;
             }
@@ -297,9 +357,15 @@ impl MemoizedSolverInner {
         best
     }
 
-    fn solve_parallel(&self, letters: &[u8], indices: &[usize], masked: LetterSet) -> u32 {
+    fn solve_parallel(
+        &self,
+        letters: &[u8],
+        indices: &[usize],
+        masked: LetterSet,
+        beta: u32,
+    ) -> u32 {
         use std::sync::atomic::{AtomicU32, Ordering};
-        let shared_alpha = AtomicU32::new(u32::MAX);
+        let shared_alpha = AtomicU32::new(beta);
         letters
             .par_iter()
             .map(|&letter| {
@@ -342,11 +408,19 @@ impl MemoizedSolverInner {
             let is_miss = pos_mask == 0;
             let miss_cost = u32::from(is_miss);
 
+            // If miss_cost alone meets alpha, prune without recursion.
+            if miss_cost >= alpha {
+                return alpha;
+            }
+
             let subset: Vec<usize> = pairs[start..start + len]
                 .iter()
                 .map(|&(_, idx)| idx)
                 .collect();
-            let val = miss_cost + self.solve_subset(&subset, new_masked);
+            // Pass beta to child: caller prunes if miss_cost + child >= alpha,
+            // so child only needs exact value when child < alpha - miss_cost.
+            let child_beta = alpha - miss_cost;
+            let val = miss_cost + self.solve_subset(&subset, new_masked, child_beta);
 
             worst = worst.max(val);
             if worst >= alpha {
@@ -362,11 +436,9 @@ impl MemoizedSolverInner {
 // Send + Sync for rayon
 // ---------------------------------------------------------------------------
 
-// SAFETY: MemoizedSolverInner is only ever used from a single `solve` call.
-// The DashMap inside is already Send+Sync; `words` is Vec<Vec<u8>> which is
-// Send. The AtomicU64 fields are Send+Sync. The struct has no raw pointers.
-// Rust derives Send/Sync automatically for all these fields, so no manual
-// impl is needed.
+// MemoizedSolverInner is Send+Sync: DashMap is Send+Sync,
+// words is Vec<Vec<u8>> (Send+Sync), atomics are Send+Sync.
+// Rust derives Send/Sync automatically for all these fields.
 
 #[cfg(test)]
 mod tests {

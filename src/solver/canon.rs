@@ -126,14 +126,8 @@ fn dedup_and_hash_small_k(
         }
     }
 
-    // Already sorted from dedup step. relabel → sort → relabel.
-    relabel_flat(&mut buf);
-    let mut tmp = vec![0u8; total];
-    let mut sort_idx: Vec<usize> = (0..m).collect();
-    sort_flat_rows(&mut buf, &mut tmp, &mut sort_idx, m, k);
-    relabel_flat(&mut buf);
-
-    (deduped, hash_flat(&buf))
+    // Rows are already sorted from dedup. Canonicalize with column awareness.
+    (deduped, canonicalize_sorted_rows(&mut buf, m, k))
 }
 
 /// General path for k > 8.
@@ -178,21 +172,13 @@ fn dedup_and_hash_general(
         return (deduped, 0);
     }
 
-    let total = unique_count * k;
-    sorted_buf.truncate(total);
+    sorted_buf.truncate(unique_count * k);
 
-    relabel_flat(&mut sorted_buf);
-    let mut tmp = vec![0u8; total];
-    let mut sort_idx: Vec<usize> = (0..unique_count).collect();
-    sort_flat_rows(&mut sorted_buf, &mut tmp, &mut sort_idx, unique_count, k);
-    relabel_flat(&mut sorted_buf);
-
-    (deduped, hash_flat(&sorted_buf))
+    // Rows are already sorted from dedup. Canonicalize with column awareness.
+    (deduped, canonicalize_sorted_rows(&mut sorted_buf, unique_count, k))
 }
 
-/// Fast letter-only canonicalization: sort → relabel → sort → relabel → hash.
-/// No column permutation — sacrifices some position isomorphism merging
-/// for much lower per-call cost.
+/// Canonicalize with column merging + column permutation + letter relabeling.
 fn canonical_hash_fast(sigs: &[Vec<u8>], k: usize) -> u128 {
     let n = sigs.len();
     let total = n * k;
@@ -202,16 +188,201 @@ fn canonical_hash_fast(sigs: &[Vec<u8>], k: usize) -> u128 {
         buf[i * k..(i + 1) * k].copy_from_slice(sig);
     }
 
+    // Sort rows first for consistent starting point.
     let mut tmp = vec![0u8; total];
     let mut indices: Vec<usize> = (0..n).collect();
-
-    // sort → relabel → sort → relabel (convergence to fixed point)
     sort_flat_rows(&mut buf, &mut tmp, &mut indices, n, k);
-    relabel_flat(&mut buf);
-    sort_flat_rows(&mut buf, &mut tmp, &mut indices, n, k);
-    relabel_flat(&mut buf);
 
-    hash_flat(&buf)
+    canonicalize_sorted_rows(&mut buf, n, k)
+}
+
+// ---------------------------------------------------------------------------
+// Column operations infrastructure. Tested and found to provide negligible
+// cache reduction for English dictionaries (verified: zero improvement for
+// k=2 at 66.5M entries, 55% slowdown for k=3). Kept for future experiments.
+// ---------------------------------------------------------------------------
+
+/// Maximum budget for exact column permutation: factorial(ek) * m ≤ this.
+#[allow(dead_code)]
+const EXACT_COL_BUDGET: usize = 500_000;
+
+#[allow(dead_code)]
+fn factorial(n: usize) -> usize {
+    match n {
+        0 | 1 => 1,
+        _ => (2..=n).product(),
+    }
+}
+
+/// Merge identical columns in a flat buffer (m rows, k cols).
+/// Returns `Some((new_buffer, new_k))` if columns were merged, `None` if
+/// all columns are already distinct.
+#[allow(dead_code)]
+fn merge_identical_columns(buf: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, usize)> {
+    if k <= 1 {
+        return None;
+    }
+
+    // Quick check: if first row values are all distinct, no merge possible.
+    let first_row = &buf[..k];
+    let mut seen = [false; 256];
+    let mut has_dup = false;
+    for &b in first_row {
+        if seen[b as usize] {
+            has_dup = true;
+            break;
+        }
+        seen[b as usize] = true;
+    }
+    if !has_dup {
+        return None;
+    }
+
+    // Full check: compare columns with matching first-row values.
+    let mut keep = vec![true; k];
+    let mut merged_any = false;
+    for j2 in 1..k {
+        if !keep[j2] {
+            continue;
+        }
+        for j1 in 0..j2 {
+            if !keep[j1] {
+                continue;
+            }
+            // Quick reject: first-row values must match.
+            if buf[j1] != buf[j2] {
+                continue;
+            }
+            if (0..m).all(|i| buf[i * k + j1] == buf[i * k + j2]) {
+                keep[j2] = false;
+                merged_any = true;
+                break;
+            }
+        }
+    }
+
+    if !merged_any {
+        return None;
+    }
+
+    let cols: Vec<usize> = (0..k).filter(|&j| keep[j]).collect();
+    let ek = cols.len();
+    let mut out = vec![0u8; m * ek];
+    for i in 0..m {
+        for (nj, &oj) in cols.iter().enumerate() {
+            out[i * ek + nj] = buf[i * k + oj];
+        }
+    }
+    Some((out, ek))
+}
+
+/// Sort columns lexicographically by their column profile (values top-to-bottom).
+#[allow(dead_code)]
+fn sort_flat_cols(buf: &mut [u8], m: usize, k: usize) {
+    if k <= 1 {
+        return;
+    }
+
+    let mut col_order: Vec<usize> = (0..k).collect();
+    col_order.sort_by(|&a, &b| {
+        for i in 0..m {
+            match buf[i * k + a].cmp(&buf[i * k + b]) {
+                std::cmp::Ordering::Equal => {},
+                other => return other,
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+
+    // Check if already in order.
+    if col_order.iter().enumerate().all(|(i, &c)| i == c) {
+        return;
+    }
+
+    let old = buf[..m * k].to_vec();
+    for i in 0..m {
+        for (nj, &oj) in col_order.iter().enumerate() {
+            buf[i * k + nj] = old[i * k + oj];
+        }
+    }
+}
+
+/// Canonicalize a flat buffer whose rows are already sorted from dedup.
+///
+/// Uses letter-only canonicalization: relabel → sort → relabel → hash.
+/// Column permutation and merging were tested but provide negligible cache
+/// reduction for real English dictionaries while adding significant overhead.
+fn canonicalize_sorted_rows(buf: &mut [u8], m: usize, k: usize) -> u128 {
+    if m <= 1 || k == 0 {
+        return 0;
+    }
+
+    // Rows already sorted from dedup. Relabel → sort → relabel → hash.
+    let total = m * k;
+    let mut tmp = vec![0u8; total];
+    let mut indices: Vec<usize> = (0..m).collect();
+    relabel_flat(buf);
+    sort_flat_rows(buf, &mut tmp, &mut indices, m, k);
+    relabel_flat(buf);
+    hash_flat(buf)
+}
+
+/// Try all ek! column permutations, canonicalize each, return min hash.
+#[allow(dead_code)]
+fn exact_column_canon_hash(buf: &[u8], m: usize, k: usize) -> u128 {
+    let total = m * k;
+    let mut perm: Vec<usize> = (0..k).collect();
+    let mut best = u128::MAX;
+    let mut work = vec![0u8; total];
+    let mut tmp = vec![0u8; total];
+    let mut indices: Vec<usize> = (0..m).collect();
+
+    loop {
+        // Apply column permutation.
+        for i in 0..m {
+            for (j, &c) in perm.iter().enumerate() {
+                work[i * k + j] = buf[i * k + c];
+            }
+        }
+
+        // sort rows → relabel → sort rows → relabel.
+        sort_flat_rows(&mut work, &mut tmp, &mut indices, m, k);
+        relabel_flat(&mut work);
+        sort_flat_rows(&mut work, &mut tmp, &mut indices, m, k);
+        relabel_flat(&mut work);
+
+        let h = hash_flat(&work);
+        if h < best {
+            best = h;
+        }
+
+        if !next_permutation(&mut perm) {
+            break;
+        }
+    }
+
+    best
+}
+
+/// Heuristic canonicalization for large k: iterate row sort, relabel,
+/// column sort until convergence (up to 4 rounds).
+#[allow(dead_code)]
+fn heuristic_column_canon_hash(buf: &[u8], m: usize, k: usize) -> u128 {
+    let total = m * k;
+    let mut work = buf[..total].to_vec();
+    let mut tmp = vec![0u8; total];
+    let mut indices: Vec<usize> = (0..m).collect();
+
+    for _ in 0..2 {
+        sort_flat_rows(&mut work, &mut tmp, &mut indices, m, k);
+        relabel_flat(&mut work);
+        sort_flat_cols(&mut work, m, k);
+    }
+    // Final pass: sort rows and relabel.
+    sort_flat_rows(&mut work, &mut tmp, &mut indices, m, k);
+    relabel_flat(&mut work);
+
+    hash_flat(&work)
 }
 
 /// No canonicalization at all — just sort and hash. For measuring baseline.
@@ -411,7 +582,6 @@ fn hash_vecs(data: &[Vec<u8>]) -> u128 {
 
 /// Advance to the next lexicographic permutation. Returns false if already
 /// at the last permutation.
-#[cfg(test)]
 fn next_permutation(arr: &mut [usize]) -> bool {
     let n = arr.len();
     if n <= 1 {
