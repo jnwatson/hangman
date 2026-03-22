@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use dashmap::DashMap;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -26,7 +29,10 @@ use crate::game::{LetterSet, letter_bit};
 /// 4. **Word deduplication**: identical effective signatures collapse to one
 ///    representative index.
 ///
-/// 5. **Parallelism**: rayon at top levels with shared atomic alpha.
+/// 5. **Lazy SMP parallelism**: for large word sets, multiple threads search
+///    independently with different move orderings, sharing a transposition
+///    table. Within each thread, YBWC-style parallelism evaluates the first
+///    letter sequentially for a tight bound, then parallelizes the rest.
 ///
 /// 6. **Compact cache key**: 128-bit hash of canonical form instead of full
 ///    Vec allocation. Collision probability ~2^-64 per pair is acceptable.
@@ -40,11 +46,12 @@ use crate::game::{LetterSet, letter_bit};
 /// `if masked & letter_bit(words[i][j]) != 0 { 0 } else { words[i][j] }`.
 pub struct MemoizedSolver {
     cache: DashMap<u128, u32>,
-    hash_calls: std::sync::atomic::AtomicU64,
-    cache_hits: std::sync::atomic::AtomicU64,
+    hash_calls: AtomicU64,
+    cache_hits: AtomicU64,
 }
 
-const PAR_THRESHOLD: usize = 100;
+/// Parallelism threshold: nodes with at least this many words use rayon.
+const PAR_THRESHOLD: usize = 50;
 
 // Cache entry encoding:
 //   Bit  31:    lower-bound flag
@@ -81,12 +88,17 @@ impl MemoizedSolver {
     pub fn new() -> Self {
         Self {
             cache: DashMap::new(),
-            hash_calls: std::sync::atomic::AtomicU64::new(0),
-            cache_hits: std::sync::atomic::AtomicU64::new(0),
+            hash_calls: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
         }
     }
 
     /// Solve for the given word list. All words must be the same length.
+    ///
+    /// For large word sets (> 25K words), uses Lazy SMP: multiple threads
+    /// search independently with different move orderings, sharing a
+    /// transposition table. For smaller sets, uses MTD(f) iterative deepening
+    /// with YBWC-style internal parallelism.
     ///
     /// # Panics
     ///
@@ -94,36 +106,71 @@ impl MemoizedSolver {
     #[must_use]
     pub fn solve(&self, words: &[Vec<u8>]) -> u32 {
         assert!(!words.is_empty());
-        let fresh = MemoizedSolverInner::new(words.to_vec());
+        let data = Arc::new(SolverData::new(words.to_vec()));
         let indices: Vec<usize> = (0..words.len()).collect();
 
-        // MTD(f)-style iterative deepening for word lists with shallow minimax
-        // trees (≤ 25K words). Each iteration fills the TT with best moves,
-        // improving subsequent iterations' move ordering.
         let result = if words.len() <= 25_000 {
+            // MTD(f)-style iterative deepening for word lists with shallow
+            // minimax trees. Each iteration fills the TT with best moves,
+            // improving subsequent iterations' move ordering.
+            let solver = MemoizedSolverInner::new(Arc::clone(&data), 0, true);
             let mut result = 0;
             for target in 0..26u32 {
-                result = fresh.solve_subset(&indices, 0, target + 1);
+                result = solver.solve_subset(&indices, 0, target + 1);
                 if result <= target {
                     break;
                 }
             }
             result
         } else {
-            fresh.solve_subset(&indices, 0, u32::MAX)
+            // Lazy SMP: primary thread uses rayon (YBWC) for internal
+            // parallelism; a few extra sequential threads explore with
+            // perturbed orderings, sharing the TT for mutual pruning.
+            let n_extra = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                / 4;
+            let n_extra = n_extra.clamp(1, 3);
+
+            std::thread::scope(|s| {
+                // Spawn extra sequential threads with perturbed orderings.
+                #[allow(clippy::cast_possible_truncation)]
+                let handles: Vec<_> = (1..=n_extra as u32)
+                    .map(|tid| {
+                        let data = Arc::clone(&data);
+                        let indices = indices.clone();
+                        s.spawn(move || {
+                            let solver = MemoizedSolverInner::new(data, tid, false);
+                            solver.solve_subset(&indices, 0, u32::MAX)
+                        })
+                    })
+                    .collect();
+
+                // Primary thread uses rayon for YBWC parallelism.
+                let main_result = {
+                    let solver = MemoizedSolverInner::new(Arc::clone(&data), 0, true);
+                    solver.solve_subset(&indices, 0, u32::MAX)
+                };
+
+                let mut best = main_result;
+                for h in handles {
+                    best = best.min(h.join().unwrap());
+                }
+                best
+            })
         };
 
-        // Transfer instrumentation to self.
+        // Transfer instrumentation to outer solver.
         self.hash_calls.fetch_add(
-            fresh.hash_calls.load(std::sync::atomic::Ordering::Relaxed),
-            std::sync::atomic::Ordering::Relaxed,
+            data.hash_calls.load(Ordering::Relaxed),
+            Ordering::Relaxed,
         );
         self.cache_hits.fetch_add(
-            fresh.cache_hits.load(std::sync::atomic::Ordering::Relaxed),
-            std::sync::atomic::Ordering::Relaxed,
+            data.cache_hits.load(Ordering::Relaxed),
+            Ordering::Relaxed,
         );
-        // Only transfer exact values to the outer cache.
-        for entry in &fresh.cache {
+        // Only transfer exact values to the persistent cache.
+        for entry in &data.cache {
             let (_, _, is_lb) = cache_unpack(*entry.value());
             if !is_lb {
                 self.cache.insert(*entry.key(), *entry.value());
@@ -140,12 +187,12 @@ impl MemoizedSolver {
 
     #[must_use]
     pub fn hash_calls(&self) -> u64 {
-        self.hash_calls.load(std::sync::atomic::Ordering::Relaxed)
+        self.hash_calls.load(Ordering::Relaxed)
     }
 
     #[must_use]
     pub fn cache_hits(&self) -> u64 {
-        self.cache_hits.load(std::sync::atomic::Ordering::Relaxed)
+        self.cache_hits.load(Ordering::Relaxed)
     }
 }
 
@@ -156,10 +203,10 @@ impl Default for MemoizedSolver {
 }
 
 // ---------------------------------------------------------------------------
-// Inner solver — owns the word list and the cache for one solve call.
+// Shared solver data — lives in an Arc, shared across Lazy SMP threads.
 // ---------------------------------------------------------------------------
 
-struct MemoizedSolverInner {
+struct SolverData {
     words: Vec<Vec<u8>>,
     /// Precomputed position masks: `pos_masks[letter_idx][word_idx]` = bitmask
     /// of positions where word contains letter (b'a' + `letter_idx`).
@@ -169,16 +216,15 @@ struct MemoizedSolverInner {
     /// present in the word. Used for fast `present_letters` computation.
     word_letters: Vec<u32>,
     cache: DashMap<u128, u32>,
-    hash_calls: std::sync::atomic::AtomicU64,
-    cache_hits: std::sync::atomic::AtomicU64,
+    hash_calls: AtomicU64,
+    cache_hits: AtomicU64,
     /// History heuristic: letters that are good moves get higher scores.
     /// Used to improve move ordering beyond partition-size heuristic.
-    history: [std::sync::atomic::AtomicU64; 26],
+    history: [AtomicU64; 26],
 }
 
-impl MemoizedSolverInner {
+impl SolverData {
     fn new(words: Vec<Vec<u8>>) -> Self {
-        // Precompute position masks for each (letter, word) pair.
         let n = words.len();
         let mut pos_masks = vec![vec![0u32; n]; 26];
         let mut word_letters = vec![0u32; n];
@@ -196,37 +242,55 @@ impl MemoizedSolverInner {
             pos_masks,
             word_letters,
             cache: DashMap::new(),
-            hash_calls: std::sync::atomic::AtomicU64::new(0),
-            cache_hits: std::sync::atomic::AtomicU64::new(0),
-            history: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            hash_calls: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            history: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-thread solver — references shared data via Arc, has own perturbation.
+// ---------------------------------------------------------------------------
+
+struct MemoizedSolverInner {
+    data: Arc<SolverData>,
+    /// 0 = primary thread (optimal TT move ordering).
+    /// > 0 = Lazy SMP secondary thread (perturbed ordering for diversity).
+    perturbation: u32,
+    /// Whether to use rayon for internal parallelism (YBWC).
+    /// False for Lazy SMP threads (parallelism comes from multiple threads).
+    use_rayon: bool,
+}
+
+impl MemoizedSolverInner {
+    fn new(data: Arc<SolverData>, perturbation: u32, use_rayon: bool) -> Self {
+        Self {
+            data,
+            perturbation,
+            use_rayon,
         }
     }
 
     /// Compute the position mask of `letter` in word `idx`.
-    ///
-    /// Bit `j` is set if position `j` contains `letter`.
-    /// Caller must ensure `letter` is not in `masked` (unguessed).
     #[inline]
     fn pos_mask_for(&self, idx: usize, letter: u8) -> u32 {
-        self.pos_masks[(letter - b'a') as usize][idx]
+        self.data.pos_masks[(letter - b'a') as usize][idx]
     }
 
     /// Collect all non-masked letters present in the word subset.
     fn present_letters(&self, indices: &[usize], masked: LetterSet) -> LetterSet {
         let mut present = 0u32;
         for &idx in indices {
-            present |= self.word_letters[idx];
+            present |= self.data.word_letters[idx];
         }
         present & !masked
     }
 
     /// Deduplicate letters by partition structure and sort by max partition size.
-    ///
-    /// Combines dedup and ordering in a single pass: compute partition fingerprint
-    /// for each letter, dedup by fingerprint, then sort by max partition size.
     fn dedup_and_order_letters(&self, letters: &[u8], indices: &[usize]) -> Vec<u8> {
         let mut seen: FxHashSet<Vec<(usize, bool)>> = FxHashSet::default();
-        // (letter, score, max_hit_part, num_parts)
+        // (letter, max_part_size, _unused, num_parts)
         let mut result: Vec<(u8, usize, usize, usize)> = Vec::new();
         let mut counts: FxHashMap<u32, usize> = FxHashMap::default();
         let mut fingerprint: Vec<(usize, bool)> = Vec::new();
@@ -251,15 +315,33 @@ impl MemoizedSolverInner {
         }
 
         // Sort by: smallest max partition first, most partitions as tiebreaker,
-        // then history heuristic for letters with identical partition stats.
+        // then history heuristic (perturbed for Lazy SMP diversity).
+        let perturbation = self.perturbation;
         result.sort_by(|a, b| {
-            a.1.cmp(&b.1).then(b.3.cmp(&a.3)).then_with(|| {
+            // Primary: always sort by max partition size (ascending).
+            let primary = a.1.cmp(&b.1);
+
+            // Secondary: partition count. Reversed for some threads.
+            let secondary = if perturbation < 2 {
+                b.3.cmp(&a.3) // more partitions = better (default)
+            } else {
+                a.3.cmp(&b.3) // fewer partitions first (diversity)
+            };
+
+            // Tertiary: history heuristic, reversed for odd perturbation.
+            let tertiary = {
                 let ha =
-                    self.history[(a.0 - b'a') as usize].load(std::sync::atomic::Ordering::Relaxed);
+                    self.data.history[(a.0 - b'a') as usize].load(Ordering::Relaxed);
                 let hb =
-                    self.history[(b.0 - b'a') as usize].load(std::sync::atomic::Ordering::Relaxed);
-                hb.cmp(&ha)
-            })
+                    self.data.history[(b.0 - b'a') as usize].load(Ordering::Relaxed);
+                if perturbation.is_multiple_of(2) {
+                    hb.cmp(&ha) // higher history = better (default)
+                } else {
+                    ha.cmp(&hb) // reversed for diversity
+                }
+            };
+
+            primary.then(secondary).then(tertiary)
         });
         result.into_iter().map(|(letter, _, _, _)| letter).collect()
     }
@@ -270,10 +352,6 @@ impl MemoizedSolverInner {
     /// masks differ between the two words AND both are non-zero (both hit,
     /// distinct partitions). Otherwise the answer is 1.
     fn solve_two_words(&self, idx_a: usize, idx_b: usize, masked: LetterSet) -> u32 {
-        let word_a = &self.words[idx_a];
-        let word_b = &self.words[idx_b];
-
-        // Collect position masks for each unmasked letter in both words.
         for letter_idx in 0..26u8 {
             let letter = b'a' + letter_idx;
             if masked & letter_bit(letter) != 0 {
@@ -286,11 +364,63 @@ impl MemoizedSolverInner {
                 return 0;
             }
         }
-        // No letter produces 2 distinct hit partitions.
-        // Any distinguishing letter creates a hit+miss split → 1 miss.
-        // (The words are distinct, so such a letter must exist.)
-        let _ = (word_a, word_b);
         1
+    }
+
+    /// Fast path for exactly 3 distinct words.
+    ///
+    /// Directly evaluates all letters without the overhead of partition
+    /// sorting, deduplication, or move ordering. For 3 words, each letter
+    /// creates at most 3 partitions, each resolvable via `solve_two_words`.
+    fn solve_three_words(
+        &self,
+        idx_a: usize,
+        idx_b: usize,
+        idx_c: usize,
+        masked: LetterSet,
+    ) -> u32 {
+        let mut best = u32::MAX;
+        for li in 0..26u8 {
+            let letter = b'a' + li;
+            if masked & letter_bit(letter) != 0 {
+                continue;
+            }
+
+            let ma = self.pos_mask_for(idx_a, letter);
+            let mb = self.pos_mask_for(idx_b, letter);
+            let mc = self.pos_mask_for(idx_c, letter);
+
+            // Skip letters not present in any word.
+            if ma == 0 && mb == 0 && mc == 0 {
+                continue;
+            }
+
+            let new_masked = masked | letter_bit(letter);
+
+            let worst = if ma == mb && mb == mc {
+                // All 3 same mask — letter doesn't discriminate.
+                u32::from(ma == 0) + self.solve_three_words(idx_a, idx_b, idx_c, new_masked)
+            } else if ma == mb {
+                // {a,b} together, {c} alone.
+                let val_ab = u32::from(ma == 0) + self.solve_two_words(idx_a, idx_b, new_masked);
+                val_ab.max(u32::from(mc == 0))
+            } else if ma == mc {
+                let val_ac = u32::from(ma == 0) + self.solve_two_words(idx_a, idx_c, new_masked);
+                val_ac.max(u32::from(mb == 0))
+            } else if mb == mc {
+                let val_bc = u32::from(mb == 0) + self.solve_two_words(idx_b, idx_c, new_masked);
+                val_bc.max(u32::from(ma == 0))
+            } else {
+                // All 3 distinct masks — each word in its own partition.
+                u32::from(ma == 0).max(u32::from(mb == 0)).max(u32::from(mc == 0))
+            };
+
+            best = best.min(worst);
+            if best == 0 {
+                return 0;
+            }
+        }
+        best
     }
 
     /// Solve a subproblem with alpha-beta pruning.
@@ -304,27 +434,30 @@ impl MemoizedSolverInner {
         }
 
         // Combined dedup + canonical hash (avoids computing effective sigs twice).
-        let (indices, cache_key) = dedup_and_hash(&self.words, indices, masked);
+        let (indices, cache_key) = dedup_and_hash(&self.data.words, indices, masked);
         if indices.len() <= 1 {
             return 0;
         }
 
-        self.hash_calls
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.data
+            .hash_calls
+            .fetch_add(1, Ordering::Relaxed);
 
         let mut tt_move: Option<u8> = None;
-        if let Some(packed) = self.cache.get(&cache_key) {
+        if let Some(packed) = self.data.cache.get(&cache_key) {
             let (val, best_letter, is_lower_bound) = cache_unpack(*packed);
             if !is_lower_bound {
                 // Exact value — always usable.
-                self.cache_hits
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.data
+                    .cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
                 return val;
             }
             if val >= beta {
                 // Lower bound that already meets/exceeds beta — prune.
-                self.cache_hits
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.data
+                    .cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
                 return val;
             }
             // Lower bound but val < beta — need to recompute with wider window.
@@ -335,13 +468,24 @@ impl MemoizedSolverInner {
         // Fast path for exactly 2 words.
         if indices.len() == 2 {
             let val = self.solve_two_words(indices[0], indices[1], masked);
-            self.cache.insert(cache_key, cache_pack(val, 0, false));
+            self.data
+                .cache
+                .insert(cache_key, cache_pack(val, 0, false));
+            return val;
+        }
+
+        // Fast path for exactly 3 words — avoids partition/ordering overhead.
+        if indices.len() == 3 {
+            let val = self.solve_three_words(indices[0], indices[1], indices[2], masked);
+            self.data
+                .cache
+                .insert(cache_key, cache_pack(val, 0, false));
             return val;
         }
 
         let present = self.present_letters(&indices, masked);
         if present == 0 {
-            self.cache.insert(cache_key, 0);
+            self.data.cache.insert(cache_key, 0);
             return 0;
         }
 
@@ -352,20 +496,21 @@ impl MemoizedSolverInner {
 
         let mut letters = self.dedup_and_order_letters(&raw_letters, &indices);
         if letters.is_empty() {
-            self.cache.insert(cache_key, 0);
+            self.data.cache.insert(cache_key, 0);
             return 0;
         }
 
-        // TT move ordering: if a previous search found a best letter, try it
-        // first for a tighter initial alpha bound → more pruning.
-        if let Some(tt_letter) = tt_move
+        // TT move ordering: primary thread uses TT move first for optimal
+        // pruning; secondary threads skip it for search diversity.
+        if self.perturbation == 0
+            && let Some(tt_letter) = tt_move
             && let Some(pos) = letters.iter().position(|&l| l == tt_letter)
             && pos > 0
         {
             letters[..=pos].rotate_right(1);
         }
 
-        let (best, best_letter) = if indices.len() >= PAR_THRESHOLD {
+        let (best, best_letter) = if self.use_rayon && indices.len() >= PAR_THRESHOLD {
             self.solve_parallel(&letters, &indices, masked, beta)
         } else {
             self.solve_sequential(&letters, &indices, masked, beta)
@@ -373,20 +518,21 @@ impl MemoizedSolverInner {
 
         if best < beta {
             // Exact value — all letters evaluated without beta truncation.
-            self.cache
+            self.data
+                .cache
                 .insert(cache_key, cache_pack(best, best_letter, false));
         } else {
             // Lower bound — store it so future queries with tight beta can prune.
             // Never overwrite an exact value with a lower bound.
             let packed = cache_pack(best, best_letter, true);
-            if let Some(mut existing) = self.cache.get_mut(&cache_key) {
+            if let Some(mut existing) = self.data.cache.get_mut(&cache_key) {
                 let (old_val, _, old_is_lb) = cache_unpack(*existing);
                 if old_is_lb && best > old_val {
                     *existing = packed;
                 }
                 // If exact (!old_is_lb), don't overwrite.
             } else {
-                self.cache.insert(cache_key, packed);
+                self.data.cache.insert(cache_key, packed);
             }
         }
         best
@@ -408,8 +554,8 @@ impl MemoizedSolverInner {
                 best = val;
                 best_letter = letter;
                 // History heuristic: reward letters that improve the bound.
-                self.history[(letter - b'a') as usize]
-                    .fetch_add(indices.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                self.data.history[(letter - b'a') as usize]
+                    .fetch_add(indices.len() as u64, Ordering::Relaxed);
             }
             if best == 0 {
                 break;
@@ -418,6 +564,8 @@ impl MemoizedSolverInner {
         (best, best_letter)
     }
 
+    /// YBWC-style parallel search: evaluate the first (best-ordered) letter
+    /// sequentially to establish a tight bound, then parallelize the rest.
     fn solve_parallel(
         &self,
         letters: &[u8],
@@ -425,12 +573,26 @@ impl MemoizedSolverInner {
         masked: LetterSet,
         beta: u32,
     ) -> (u32, u8) {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        let shared_alpha = AtomicU32::new(beta);
-        let result = letters
+        // Evaluate first letter sequentially to get a tight initial bound.
+        let first_val = self.evaluate_letter(indices, masked, letters[0], beta);
+        let mut best = first_val;
+        let mut best_letter = letters[0];
+
+        if best == 0 || letters.len() <= 1 {
+            self.data.history[(best_letter - b'a') as usize]
+                .fetch_add(indices.len() as u64, Ordering::Relaxed);
+            return (best, best_letter);
+        }
+
+        // Parallelize remaining letters with the tighter bound from first.
+        let shared_alpha = std::sync::atomic::AtomicU32::new(best.min(beta));
+        let rest = letters[1..]
             .par_iter()
             .map(|&letter| {
                 let current_alpha = shared_alpha.load(Ordering::Relaxed);
+                if current_alpha == 0 {
+                    return (u32::MAX, letter);
+                }
                 let val = self.evaluate_letter(indices, masked, letter, current_alpha);
                 shared_alpha.fetch_min(val, Ordering::Relaxed);
                 (val, letter)
@@ -439,15 +601,27 @@ impl MemoizedSolverInner {
                 || (u32::MAX, 0),
                 |(v1, l1), (v2, l2)| if v1 <= v2 { (v1, l1) } else { (v2, l2) },
             );
-        // Update history for the best letter found.
-        if result.1 >= b'a' {
-            self.history[(result.1 - b'a') as usize]
-                .fetch_add(indices.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+        if rest.0 < best {
+            best = rest.0;
+            best_letter = rest.1;
         }
-        result
+
+        // Update history for the best letter found.
+        if best_letter >= b'a' {
+            self.data.history[(best_letter - b'a') as usize]
+                .fetch_add(indices.len() as u64, Ordering::Relaxed);
+        }
+        (best, best_letter)
     }
 
-    fn evaluate_letter(&self, indices: &[usize], masked: LetterSet, letter: u8, alpha: u32) -> u32 {
+    fn evaluate_letter(
+        &self,
+        indices: &[usize],
+        masked: LetterSet,
+        letter: u8,
+        alpha: u32,
+    ) -> u32 {
         // Build (pos_mask, word_idx) pairs and sort by pos_mask.
         let mut pairs: Vec<(u32, usize)> = indices
             .iter()
@@ -511,9 +685,10 @@ impl MemoizedSolverInner {
 // Send + Sync for rayon
 // ---------------------------------------------------------------------------
 
-// MemoizedSolverInner is Send+Sync: DashMap is Send+Sync,
-// words is Vec<Vec<u8>> (Send+Sync), atomics are Send+Sync.
-// Rust derives Send/Sync automatically for all these fields.
+// MemoizedSolverInner is Send+Sync: Arc<SolverData> is Send+Sync,
+// u32 and bool are Send+Sync.
+// SolverData is Send+Sync: DashMap is Send+Sync, words is Vec<Vec<u8>>
+// (Send+Sync), atomics are Send+Sync.
 
 #[cfg(test)]
 mod tests {
