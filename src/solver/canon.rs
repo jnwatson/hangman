@@ -175,7 +175,10 @@ fn dedup_and_hash_general(
     sorted_buf.truncate(unique_count * k);
 
     // Rows are already sorted from dedup. Canonicalize with column awareness.
-    (deduped, canonicalize_sorted_rows(&mut sorted_buf, unique_count, k))
+    (
+        deduped,
+        canonicalize_sorted_rows(&mut sorted_buf, unique_count, k),
+    )
 }
 
 /// Canonicalize with column merging + column permutation + letter relabeling.
@@ -287,7 +290,7 @@ fn sort_flat_cols(buf: &mut [u8], m: usize, k: usize) {
     col_order.sort_by(|&a, &b| {
         for i in 0..m {
             match buf[i * k + a].cmp(&buf[i * k + b]) {
-                std::cmp::Ordering::Equal => {},
+                std::cmp::Ordering::Equal => {}
                 other => return other,
             }
         }

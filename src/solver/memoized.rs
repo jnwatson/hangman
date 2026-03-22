@@ -46,23 +46,34 @@ pub struct MemoizedSolver {
 
 const PAR_THRESHOLD: usize = 100;
 
-// Cache entry encoding: bit 31 = lower-bound flag, bits 0..30 = value.
-// Values are always ≤ 25 (at most 26 letters), so this is safe.
+// Cache entry encoding:
+//   Bit  31:    lower-bound flag
+//   Bits 5-9:   best letter index (0-25), 31 = none
+//   Bits 0-4:   value (0-25)
+// Values are always ≤ 25 (at most 26 letters), so 5 bits suffice.
 const LOWER_BOUND_BIT: u32 = 1 << 31;
+const VALUE_MASK: u32 = 0x1F;
+const LETTER_SHIFT: u32 = 5;
 
 #[inline]
-fn cache_exact(v: u32) -> u32 {
-    v
+fn cache_pack(value: u32, best_letter: u8, is_lower_bound: bool) -> u32 {
+    let letter_idx = u32::from(best_letter.wrapping_sub(b'a'));
+    let letter_bits = if letter_idx < 26 { letter_idx } else { 31 };
+    let lb = if is_lower_bound { LOWER_BOUND_BIT } else { 0 };
+    (value & VALUE_MASK) | (letter_bits << LETTER_SHIFT) | lb
 }
 
 #[inline]
-fn cache_lower_bound(v: u32) -> u32 {
-    v | LOWER_BOUND_BIT
-}
-
-#[inline]
-fn cache_unpack(packed: u32) -> (u32, bool) {
-    (packed & !LOWER_BOUND_BIT, packed & LOWER_BOUND_BIT != 0)
+fn cache_unpack(packed: u32) -> (u32, Option<u8>, bool) {
+    let value = packed & VALUE_MASK;
+    let letter_idx = (packed >> LETTER_SHIFT) & 0x1F;
+    let best_letter = if letter_idx < 26 {
+        Some(b'a' + letter_idx as u8)
+    } else {
+        None
+    };
+    let is_lb = packed & LOWER_BOUND_BIT != 0;
+    (value, best_letter, is_lb)
 }
 
 impl MemoizedSolver {
@@ -85,7 +96,22 @@ impl MemoizedSolver {
         assert!(!words.is_empty());
         let fresh = MemoizedSolverInner::new(words.to_vec());
         let indices: Vec<usize> = (0..words.len()).collect();
-        let result = fresh.solve_subset(&indices, 0, u32::MAX);
+
+        // MTD(f)-style iterative deepening for word lists with shallow minimax
+        // trees (≤ 25K words). Each iteration fills the TT with best moves,
+        // improving subsequent iterations' move ordering.
+        let result = if words.len() <= 25_000 {
+            let mut result = 0;
+            for target in 0..26u32 {
+                result = fresh.solve_subset(&indices, 0, target + 1);
+                if result <= target {
+                    break;
+                }
+            }
+            result
+        } else {
+            fresh.solve_subset(&indices, 0, u32::MAX)
+        };
 
         // Transfer instrumentation to self.
         self.hash_calls.fetch_add(
@@ -98,7 +124,7 @@ impl MemoizedSolver {
         );
         // Only transfer exact values to the outer cache.
         for entry in &fresh.cache {
-            let (_, is_lb) = cache_unpack(*entry.value());
+            let (_, _, is_lb) = cache_unpack(*entry.value());
             if !is_lb {
                 self.cache.insert(*entry.key(), *entry.value());
             }
@@ -135,63 +161,73 @@ impl Default for MemoizedSolver {
 
 struct MemoizedSolverInner {
     words: Vec<Vec<u8>>,
+    /// Precomputed position masks: `pos_masks[letter_idx][word_idx]` = bitmask
+    /// of positions where word contains letter (b'a' + `letter_idx`).
+    /// Avoids O(k) per-call work in `pos_mask_for`.
+    pos_masks: Vec<Vec<u32>>, // 26 × n_words
+    /// Precomputed letter sets: `word_letters[word_idx]` = bitmask of letters
+    /// present in the word. Used for fast `present_letters` computation.
+    word_letters: Vec<u32>,
     cache: DashMap<u128, u32>,
     hash_calls: std::sync::atomic::AtomicU64,
     cache_hits: std::sync::atomic::AtomicU64,
+    /// History heuristic: letters that are good moves get higher scores.
+    /// Used to improve move ordering beyond partition-size heuristic.
+    history: [std::sync::atomic::AtomicU64; 26],
 }
 
 impl MemoizedSolverInner {
     fn new(words: Vec<Vec<u8>>) -> Self {
-        Self {
-            words,
-            cache: DashMap::new(),
-            hash_calls: std::sync::atomic::AtomicU64::new(0),
-            cache_hits: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
-    /// Compute the position mask of `letter` in word `idx` under `masked`.
-    ///
-    /// Bit `j` is set if position `j` is not already masked AND contains
-    /// `letter`. (Already-masked positions read as 0, so they can't match a
-    /// real letter.)
-    #[inline]
-    fn pos_mask_for(&self, idx: usize, letter: u8, masked: LetterSet) -> u32 {
-        let word = &self.words[idx];
-        let mut mask = 0u32;
-        for (j, &b) in word.iter().enumerate() {
-            if b == letter && masked & letter_bit(b) == 0 {
-                mask |= 1 << j;
-            }
-        }
-        mask
-    }
-
-    /// Collect all non-zero, non-masked letters present in the word subset.
-    fn present_letters(&self, indices: &[usize], masked: LetterSet) -> LetterSet {
-        let mut present = 0u32;
-        for &idx in indices {
-            for &b in &self.words[idx] {
-                if b != 0 && masked & letter_bit(b) == 0 {
-                    present |= letter_bit(b);
+        // Precompute position masks for each (letter, word) pair.
+        let n = words.len();
+        let mut pos_masks = vec![vec![0u32; n]; 26];
+        let mut word_letters = vec![0u32; n];
+        for (idx, word) in words.iter().enumerate() {
+            for (j, &b) in word.iter().enumerate() {
+                if b.is_ascii_lowercase() {
+                    let li = (b - b'a') as usize;
+                    pos_masks[li][idx] |= 1 << j;
+                    word_letters[idx] |= 1 << li;
                 }
             }
         }
-        present
+        Self {
+            words,
+            pos_masks,
+            word_letters,
+            cache: DashMap::new(),
+            hash_calls: std::sync::atomic::AtomicU64::new(0),
+            cache_hits: std::sync::atomic::AtomicU64::new(0),
+            history: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Compute the position mask of `letter` in word `idx`.
+    ///
+    /// Bit `j` is set if position `j` contains `letter`.
+    /// Caller must ensure `letter` is not in `masked` (unguessed).
+    #[inline]
+    fn pos_mask_for(&self, idx: usize, letter: u8) -> u32 {
+        self.pos_masks[(letter - b'a') as usize][idx]
+    }
+
+    /// Collect all non-masked letters present in the word subset.
+    fn present_letters(&self, indices: &[usize], masked: LetterSet) -> LetterSet {
+        let mut present = 0u32;
+        for &idx in indices {
+            present |= self.word_letters[idx];
+        }
+        present & !masked
     }
 
     /// Deduplicate letters by partition structure and sort by max partition size.
     ///
     /// Combines dedup and ordering in a single pass: compute partition fingerprint
     /// for each letter, dedup by fingerprint, then sort by max partition size.
-    fn dedup_and_order_letters(
-        &self,
-        letters: &[u8],
-        indices: &[usize],
-        masked: LetterSet,
-    ) -> Vec<u8> {
+    fn dedup_and_order_letters(&self, letters: &[u8], indices: &[usize]) -> Vec<u8> {
         let mut seen: FxHashSet<Vec<(usize, bool)>> = FxHashSet::default();
-        let mut result: Vec<(u8, usize, usize)> = Vec::new(); // (letter, max_partition, num_parts)
+        // (letter, score, max_hit_part, num_parts)
+        let mut result: Vec<(u8, usize, usize, usize)> = Vec::new();
         let mut counts: FxHashMap<u32, usize> = FxHashMap::default();
         let mut fingerprint: Vec<(usize, bool)> = Vec::new();
 
@@ -199,7 +235,7 @@ impl MemoizedSolverInner {
             counts.clear();
             let mut max_part = 0usize;
             for &idx in indices {
-                let mask = self.pos_mask_for(idx, letter, masked);
+                let mask = self.pos_mask_for(idx, letter);
                 let count = counts.entry(mask).or_insert(0);
                 *count += 1;
                 max_part = max_part.max(*count);
@@ -210,14 +246,22 @@ impl MemoizedSolverInner {
             fingerprint.sort_unstable();
 
             if seen.insert(fingerprint.clone()) {
-                // Order by: smallest max partition first, then most partitions first
-                // (as tiebreaker). Encoding: (max_part, -num_parts) as sort key.
-                result.push((letter, max_part, num_parts));
+                result.push((letter, max_part, 0, num_parts));
             }
         }
 
-        result.sort_by(|a, b| a.1.cmp(&b.1).then(b.2.cmp(&a.2)));
-        result.into_iter().map(|(letter, _, _)| letter).collect()
+        // Sort by: smallest max partition first, most partitions as tiebreaker,
+        // then history heuristic for letters with identical partition stats.
+        result.sort_by(|a, b| {
+            a.1.cmp(&b.1).then(b.3.cmp(&a.3)).then_with(|| {
+                let ha =
+                    self.history[(a.0 - b'a') as usize].load(std::sync::atomic::Ordering::Relaxed);
+                let hb =
+                    self.history[(b.0 - b'a') as usize].load(std::sync::atomic::Ordering::Relaxed);
+                hb.cmp(&ha)
+            })
+        });
+        result.into_iter().map(|(letter, _, _, _)| letter).collect()
     }
 
     /// Fast path for exactly 2 distinct words.
@@ -235,8 +279,8 @@ impl MemoizedSolverInner {
             if masked & letter_bit(letter) != 0 {
                 continue;
             }
-            let mask_a = self.pos_mask_for(idx_a, letter, masked);
-            let mask_b = self.pos_mask_for(idx_b, letter, masked);
+            let mask_a = self.pos_mask_for(idx_a, letter);
+            let mask_b = self.pos_mask_for(idx_b, letter);
             // Both non-zero and different → 2 distinct hit partitions, 0 misses.
             if mask_a != 0 && mask_b != 0 && mask_a != mask_b {
                 return 0;
@@ -248,8 +292,6 @@ impl MemoizedSolverInner {
         let _ = (word_a, word_b);
         1
     }
-
-    // ------------------------------------------------------------------
 
     /// Solve a subproblem with alpha-beta pruning.
     ///
@@ -270,8 +312,9 @@ impl MemoizedSolverInner {
         self.hash_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        let mut tt_move: Option<u8> = None;
         if let Some(packed) = self.cache.get(&cache_key) {
-            let (val, is_lower_bound) = cache_unpack(*packed);
+            let (val, best_letter, is_lower_bound) = cache_unpack(*packed);
             if !is_lower_bound {
                 // Exact value — always usable.
                 self.cache_hits
@@ -285,12 +328,14 @@ impl MemoizedSolverInner {
                 return val;
             }
             // Lower bound but val < beta — need to recompute with wider window.
+            // Save the TT move for ordering: try it first for tighter initial alpha.
+            tt_move = best_letter;
         }
 
         // Fast path for exactly 2 words.
         if indices.len() == 2 {
             let val = self.solve_two_words(indices[0], indices[1], masked);
-            self.cache.insert(cache_key, cache_exact(val));
+            self.cache.insert(cache_key, cache_pack(val, 0, false));
             return val;
         }
 
@@ -304,13 +349,23 @@ impl MemoizedSolverInner {
             .filter(|i| present & (1u32 << i) != 0)
             .map(|i| b'a' + i)
             .collect();
-        let letters = self.dedup_and_order_letters(&raw_letters, &indices, masked);
+
+        let mut letters = self.dedup_and_order_letters(&raw_letters, &indices);
         if letters.is_empty() {
             self.cache.insert(cache_key, 0);
             return 0;
         }
 
-        let best = if indices.len() >= PAR_THRESHOLD {
+        // TT move ordering: if a previous search found a best letter, try it
+        // first for a tighter initial alpha bound → more pruning.
+        if let Some(tt_letter) = tt_move
+            && let Some(pos) = letters.iter().position(|&l| l == tt_letter)
+            && pos > 0
+        {
+            letters[..=pos].rotate_right(1);
+        }
+
+        let (best, best_letter) = if indices.len() >= PAR_THRESHOLD {
             self.solve_parallel(&letters, &indices, masked, beta)
         } else {
             self.solve_sequential(&letters, &indices, masked, beta)
@@ -318,13 +373,14 @@ impl MemoizedSolverInner {
 
         if best < beta {
             // Exact value — all letters evaluated without beta truncation.
-            self.cache.insert(cache_key, cache_exact(best));
+            self.cache
+                .insert(cache_key, cache_pack(best, best_letter, false));
         } else {
             // Lower bound — store it so future queries with tight beta can prune.
             // Never overwrite an exact value with a lower bound.
-            let packed = cache_lower_bound(best);
+            let packed = cache_pack(best, best_letter, true);
             if let Some(mut existing) = self.cache.get_mut(&cache_key) {
-                let (old_val, old_is_lb) = cache_unpack(*existing);
+                let (old_val, _, old_is_lb) = cache_unpack(*existing);
                 if old_is_lb && best > old_val {
                     *existing = packed;
                 }
@@ -342,19 +398,24 @@ impl MemoizedSolverInner {
         indices: &[usize],
         masked: LetterSet,
         beta: u32,
-    ) -> u32 {
+    ) -> (u32, u8) {
         let mut best = u32::MAX;
+        let mut best_letter = letters[0];
         for &letter in letters {
             let alpha = best.min(beta);
             let val = self.evaluate_letter(indices, masked, letter, alpha);
             if val < best {
                 best = val;
+                best_letter = letter;
+                // History heuristic: reward letters that improve the bound.
+                self.history[(letter - b'a') as usize]
+                    .fetch_add(indices.len() as u64, std::sync::atomic::Ordering::Relaxed);
             }
             if best == 0 {
                 break;
             }
         }
-        best
+        (best, best_letter)
     }
 
     fn solve_parallel(
@@ -363,31 +424,38 @@ impl MemoizedSolverInner {
         indices: &[usize],
         masked: LetterSet,
         beta: u32,
-    ) -> u32 {
+    ) -> (u32, u8) {
         use std::sync::atomic::{AtomicU32, Ordering};
         let shared_alpha = AtomicU32::new(beta);
-        letters
+        let result = letters
             .par_iter()
             .map(|&letter| {
                 let current_alpha = shared_alpha.load(Ordering::Relaxed);
                 let val = self.evaluate_letter(indices, masked, letter, current_alpha);
                 shared_alpha.fetch_min(val, Ordering::Relaxed);
-                val
+                (val, letter)
             })
-            .min()
-            .unwrap_or(0)
+            .reduce(
+                || (u32::MAX, 0),
+                |(v1, l1), (v2, l2)| if v1 <= v2 { (v1, l1) } else { (v2, l2) },
+            );
+        // Update history for the best letter found.
+        if result.1 >= b'a' {
+            self.history[(result.1 - b'a') as usize]
+                .fetch_add(indices.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
     }
 
     fn evaluate_letter(&self, indices: &[usize], masked: LetterSet, letter: u8, alpha: u32) -> u32 {
         // Build (pos_mask, word_idx) pairs and sort by pos_mask.
-        // This avoids HashMap allocation for partitioning.
         let mut pairs: Vec<(u32, usize)> = indices
             .iter()
-            .map(|&idx| (self.pos_mask_for(idx, letter, masked), idx))
+            .map(|&idx| (self.pos_mask_for(idx, letter), idx))
             .collect();
         pairs.sort_unstable_by_key(|&(mask, _)| mask);
 
-        // Identify partition boundaries and sizes, then sort by size (descending).
+        // Identify partition boundaries and sizes.
         let mut boundaries: Vec<(u32, usize, usize)> = Vec::new(); // (mask, start, len)
         let mut i = 0;
         while i < pairs.len() {
@@ -398,15 +466,21 @@ impl MemoizedSolverInner {
             }
             boundaries.push((mask, start, i - start));
         }
-        // Evaluate largest partitions first for better alpha-beta cutoff.
-        boundaries.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+
+        // Evaluate miss partition first (pos_mask == 0) since it has +1 miss cost,
+        // making it most likely to exceed alpha and trigger cutoff. Then largest
+        // partitions first among hit partitions.
+        boundaries.sort_unstable_by(|a, b| {
+            let a_is_miss = u32::from(a.0 != 0); // miss=0 sorts first
+            let b_is_miss = u32::from(b.0 != 0);
+            a_is_miss.cmp(&b_is_miss).then(b.2.cmp(&a.2))
+        });
 
         let new_masked = masked | letter_bit(letter);
         let mut worst = 0u32;
 
         for &(pos_mask, start, len) in &boundaries {
-            let is_miss = pos_mask == 0;
-            let miss_cost = u32::from(is_miss);
+            let miss_cost = u32::from(pos_mask == 0);
 
             // If miss_cost alone meets alpha, prune without recursion.
             if miss_cost >= alpha {
@@ -417,6 +491,7 @@ impl MemoizedSolverInner {
                 .iter()
                 .map(|&(_, idx)| idx)
                 .collect();
+
             // Pass beta to child: caller prunes if miss_cost + child >= alpha,
             // so child only needs exact value when child < alpha - miss_cost.
             let child_beta = alpha - miss_cost;
