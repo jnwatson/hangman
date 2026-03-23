@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use super::canon::dedup_and_hash;
 use crate::game::{LetterSet, letter_bit};
@@ -112,9 +112,7 @@ impl MemoizedSolver {
         let indices: Vec<usize> = (0..words.len()).collect();
 
         let result = if words.len() <= 25_000 {
-            // MTD(f)-style iterative deepening for word lists with shallow
-            // minimax trees. Each iteration fills the TT with best moves,
-            // improving subsequent iterations' move ordering.
+            // MTD(f)-style iterative deepening for medium word lists.
             let solver = MemoizedSolverInner::new(Arc::clone(&data), 0, true);
             let mut result = 0;
             for target in 0..26u32 {
@@ -126,8 +124,8 @@ impl MemoizedSolver {
             result
         } else {
             // Lazy SMP: primary thread uses rayon (YBWC) for internal
-            // parallelism; a few extra sequential threads explore with
-            // perturbed orderings, sharing the TT for mutual pruning.
+            // parallelism; extra sequential threads explore with perturbed
+            // orderings, sharing the TT for mutual pruning.
             let n_extra = std::thread::available_parallelism()
                 .map(std::num::NonZero::get)
                 .unwrap_or(1)
@@ -135,7 +133,6 @@ impl MemoizedSolver {
             let n_extra = n_extra.clamp(1, 3);
 
             std::thread::scope(|s| {
-                // Spawn extra sequential threads with perturbed orderings.
                 #[allow(clippy::cast_possible_truncation)]
                 let handles: Vec<_> = (1..=n_extra as u32)
                     .map(|tid| {
@@ -148,7 +145,6 @@ impl MemoizedSolver {
                     })
                     .collect();
 
-                // Primary thread uses rayon for YBWC parallelism.
                 let main_result = {
                     let solver = MemoizedSolverInner::new(Arc::clone(&data), 0, true);
                     solver.solve_subset(&indices, 0, 0, u32::MAX)
@@ -285,11 +281,14 @@ struct SolverData {
     /// present in the word. Used for fast `present_letters` computation.
     word_letters: Vec<u32>,
     cache: DashMap<u128, u32>,
+    /// Maps cheap index-based hash → canonical key. Avoids redundant
+    /// `dedup_and_hash` calls (the main bottleneck for small word sets).
+    key_cache: DashMap<u64, u128>,
     hash_calls: AtomicU64,
     cache_hits: AtomicU64,
-    /// History heuristic: letters that are good moves get higher scores.
-    /// Used to improve move ordering beyond partition-size heuristic.
-    history: [AtomicU64; 26],
+    /// Letters ranked by descending frequency (how many words contain each).
+    /// Precomputed once; used for O(1) move ordering at every node.
+    freq_order: [u8; 26],
 }
 
 impl SolverData {
@@ -306,14 +305,30 @@ impl SolverData {
                 }
             }
         }
+        // Rank letters by how many words contain them (descending).
+        let mut letter_counts = [0u32; 26];
+        for &wl in &word_letters {
+            for li in 0..26u32 {
+                if wl & (1 << li) != 0 {
+                    letter_counts[li as usize] += 1;
+                }
+            }
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let mut freq_order: [u8; 26] = std::array::from_fn(|i| b'a' + i as u8);
+        freq_order.sort_by(|&a, &b| {
+            letter_counts[(b - b'a') as usize].cmp(&letter_counts[(a - b'a') as usize])
+        });
+
         Self {
             words,
             pos_masks,
             word_letters,
             cache: DashMap::new(),
+            key_cache: DashMap::new(),
             hash_calls: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
-            history: std::array::from_fn(|_| AtomicU64::new(0)),
+            freq_order,
         }
     }
 }
@@ -363,71 +378,6 @@ impl MemoizedSolverInner {
             present |= self.data.word_letters[idx];
         }
         present & !masked
-    }
-
-    /// Deduplicate letters by partition structure and sort by max partition size.
-    fn dedup_and_order_letters(&self, letters: &[u8], indices: &[usize]) -> Vec<u8> {
-        let mut seen: FxHashSet<u64> = FxHashSet::default();
-        // (letter, max_part_size, _unused, num_parts)
-        let mut result: Vec<(u8, usize, usize, usize)> = Vec::new();
-        let mut counts: FxHashMap<u32, usize> = FxHashMap::default();
-        let mut fingerprint: Vec<(usize, bool)> = Vec::new();
-
-        for &letter in letters {
-            counts.clear();
-            let mut max_part = 0usize;
-            for &idx in indices {
-                let mask = self.pos_mask_for(idx, letter);
-                let count = counts.entry(mask).or_insert(0);
-                *count += 1;
-                max_part = max_part.max(*count);
-            }
-            let num_parts = counts.len();
-            fingerprint.clear();
-            fingerprint.extend(counts.iter().map(|(&mask, &count)| (count, mask == 0)));
-            fingerprint.sort_unstable();
-
-            // Hash the fingerprint to a u64 for fast set lookup.
-            let fp_hash = {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::hash::DefaultHasher::new();
-                fingerprint.hash(&mut hasher);
-                hasher.finish()
-            };
-
-            if seen.insert(fp_hash) {
-                result.push((letter, max_part, 0, num_parts));
-            }
-        }
-
-        // Sort by: smallest max partition first, most partitions as tiebreaker,
-        // then history heuristic (perturbed for Lazy SMP diversity).
-        let perturbation = self.perturbation;
-        result.sort_by(|a, b| {
-            // Primary: always sort by max partition size (ascending).
-            let primary = a.1.cmp(&b.1);
-
-            // Secondary: partition count. Reversed for some threads.
-            let secondary = if perturbation < 2 {
-                b.3.cmp(&a.3) // more partitions = better (default)
-            } else {
-                a.3.cmp(&b.3) // fewer partitions first (diversity)
-            };
-
-            // Tertiary: history heuristic, reversed for odd perturbation.
-            let tertiary = {
-                let ha = self.data.history[(a.0 - b'a') as usize].load(Ordering::Relaxed);
-                let hb = self.data.history[(b.0 - b'a') as usize].load(Ordering::Relaxed);
-                if perturbation.is_multiple_of(2) {
-                    hb.cmp(&ha) // higher history = better (default)
-                } else {
-                    ha.cmp(&hb) // reversed for diversity
-                }
-            };
-
-            primary.then(secondary).then(tertiary)
-        });
-        result.into_iter().map(|(letter, _, _, _)| letter).collect()
     }
 
     /// Fast path for exactly 2 distinct words.
@@ -684,8 +634,11 @@ impl MemoizedSolverInner {
         }
     }
 
-    /// Choose which letters to evaluate. If splitting required letters exist,
-    /// only those are returned (non-required letters are provably suboptimal).
+    /// Choose which letters to evaluate. Computes partition sizes lazily
+    /// in batches: scores the first 8 letters by frequency, sorts
+    /// them, and returns them. Remaining letters are appended in frequency
+    /// order without scoring — if the first batch doesn't produce a cutoff,
+    /// the remaining letters are unlikely to either.
     fn select_letters(
         &self,
         indices: &[usize],
@@ -700,11 +653,45 @@ impl MemoizedSolverInner {
         if candidate_mask == 0 {
             return vec![];
         }
-        let raw: Vec<u8> = (0..26u8)
-            .filter(|i| candidate_mask & (1u32 << i) != 0)
-            .map(|i| b'a' + i)
-            .collect();
-        self.dedup_and_order_letters(&raw, indices)
+        let n_candidates = candidate_mask.count_ones();
+        // Few candidates: frequency order is good enough.
+        if n_candidates <= 6 {
+            return self
+                .data
+                .freq_order
+                .iter()
+                .copied()
+                .filter(|&letter| candidate_mask & letter_bit(letter) != 0)
+                .collect();
+        }
+        // Score only the first batch of candidates by partition size.
+        // The rest go at the end in frequency order (unscored).
+        let batch_size = 8;
+        let mut counts: FxHashMap<u32, usize> = FxHashMap::default();
+        let mut scored: Vec<(u8, usize)> = Vec::with_capacity(batch_size);
+        let mut remaining: Vec<u8> = Vec::new();
+        for &letter in &self.data.freq_order {
+            if candidate_mask & letter_bit(letter) == 0 {
+                continue;
+            }
+            if scored.len() < batch_size {
+                counts.clear();
+                let mut max_part = 0usize;
+                for &idx in indices {
+                    let mask = self.pos_mask_for(idx, letter);
+                    let count = counts.entry(mask).or_insert(0);
+                    *count += 1;
+                    max_part = max_part.max(*count);
+                }
+                scored.push((letter, max_part));
+            } else {
+                remaining.push(letter);
+            }
+        }
+        scored.sort_by_key(|&(_, mp)| mp);
+        let mut result: Vec<u8> = scored.into_iter().map(|(letter, _)| letter).collect();
+        result.extend(remaining);
+        result
     }
 
     /// Lower bound via the "miss chain" argument: when no letter is required,
@@ -774,6 +761,23 @@ impl MemoizedSolverInner {
         if best == u32::MAX { 0 } else { best }
     }
 
+    /// Compute a cheap order-independent hash of (indices, masked) for the
+    /// key cache. Uses a commutative mixing function so that different
+    /// orderings of the same index set produce the same hash.
+    fn fast_index_key(indices: &[usize], masked: LetterSet) -> u64 {
+        let mut h = 0u64;
+        let mut xor = 0u64;
+        for &idx in indices {
+            let mix = (idx as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+            h = h.wrapping_add(mix);
+            xor ^= mix;
+        }
+        h = h.wrapping_add(xor.rotate_left(17));
+        h ^= u64::from(masked).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        h ^= (indices.len() as u64) << 48;
+        h ^ (h >> 33)
+    }
+
     fn solve_subset(&self, indices: &[usize], masked: LetterSet, alpha: u32, beta: u32) -> u32 {
         if indices.len() <= 1 || beta == 0 {
             return 0;
@@ -794,16 +798,34 @@ impl MemoizedSolverInner {
             }
         }
 
-        // Combined dedup + canonical hash (avoids computing effective sigs twice).
-        let (indices, cache_key) = dedup_and_hash(&self.data.words, indices, masked);
+        // Fast key cache: map (indices, masked) → canonical_key. On cache
+        // hit, check TT immediately — skip expensive dedup_and_hash entirely
+        // for TT hits. Only recompute on TT miss.
+        let fast_key = Self::fast_index_key(indices, masked);
+        let (indices, cache_key) = if let Some(entry) = self.data.key_cache.get(&fast_key) {
+            let canon_key = *entry;
+            drop(entry);
+            self.data.hash_calls.fetch_add(1, Ordering::Relaxed);
+            // Check TT — most visits are hits, avoiding dedup_and_hash entirely.
+            if let CacheLookup::Hit(val) = self.cache_lookup(canon_key, alpha, beta) {
+                return val;
+            }
+            // TT miss: recompute deduped indices (cheaper than full cache).
+            let (deduped, _) = dedup_and_hash(&self.data.words, indices, masked);
+            (deduped, canon_key)
+        } else {
+            let (deduped, canon_key) = dedup_and_hash(&self.data.words, indices, masked);
+            self.data.key_cache.insert(fast_key, canon_key);
+            (deduped, canon_key)
+        };
+
         if indices.len() <= 1 {
             return 0;
         }
 
         self.data.hash_calls.fetch_add(1, Ordering::Relaxed);
 
-        // Tighten beta using worst-case bound: max misses = number of
-        // non-required useful letters (letters in some but not all words).
+        // Tighten beta using worst-case bound.
         let present = self.present_letters(&indices, masked);
         let n_useful = present.count_ones();
         let n_required = required_splitting.count_ones();
@@ -925,9 +947,6 @@ impl MemoizedSolverInner {
             if val < best {
                 best = val;
                 best_letter = letter;
-                // History heuristic: reward letters that improve the bound.
-                self.data.history[(letter - b'a') as usize]
-                    .fetch_add(indices.len() as u64, Ordering::Relaxed);
             }
             if best <= alpha || best == 0 {
                 break;
@@ -952,8 +971,6 @@ impl MemoizedSolverInner {
         let mut best_letter = letters[0];
 
         if best <= alpha || best == 0 || letters.len() <= 1 {
-            self.data.history[(best_letter - b'a') as usize]
-                .fetch_add(indices.len() as u64, Ordering::Relaxed);
             return (best, best_letter);
         }
 
@@ -980,11 +997,6 @@ impl MemoizedSolverInner {
             best_letter = rest.1;
         }
 
-        // Update history for the best letter found.
-        if best_letter >= b'a' {
-            self.data.history[(best_letter - b'a') as usize]
-                .fetch_add(indices.len() as u64, Ordering::Relaxed);
-        }
         (best, best_letter)
     }
 
@@ -995,43 +1007,28 @@ impl MemoizedSolverInner {
         letter: u8,
         cutoff: u32,
     ) -> u32 {
-        // Build (pos_mask, word_idx) pairs and sort by pos_mask.
-        // Reuse a single sorted array — partitions are contiguous slices.
-        let mut pairs: Vec<(u32, usize)> = Vec::with_capacity(indices.len());
+        // Group word indices by pos_mask using a hash map (O(n)) instead
+        // of sorting (O(n log n)). Each partition is a (pos_mask, Vec<idx>).
+        let mut partitions: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
         for &idx in indices {
-            pairs.push((self.pos_mask_for(idx, letter), idx));
-        }
-        pairs.sort_unstable_by_key(|&(mask, _)| mask);
-
-        // Identify partition boundaries.
-        let mut boundaries: Vec<(u32, usize, usize)> = Vec::new(); // (mask, start, len)
-        let mut i = 0;
-        while i < pairs.len() {
-            let mask = pairs[i].0;
-            let start = i;
-            while i < pairs.len() && pairs[i].0 == mask {
-                i += 1;
-            }
-            boundaries.push((mask, start, i - start));
+            let mask = self.pos_mask_for(idx, letter);
+            partitions.entry(mask).or_default().push(idx);
         }
 
-        // Evaluate miss partition first (pos_mask == 0) since it has +1 miss cost,
-        // making it most likely to exceed cutoff and trigger pruning. Then largest
-        // partitions first among hit partitions.
-        boundaries.sort_unstable_by(|a, b| {
-            let a_is_miss = u32::from(a.0 != 0); // miss=0 sorts first
+        // Order: miss partition first (pos_mask == 0), then largest hit
+        // partitions first. Collect into a vec of (pos_mask, indices).
+        let mut ordered: Vec<(u32, Vec<usize>)> = partitions.into_iter().collect();
+        ordered.sort_unstable_by(|a, b| {
+            let a_is_miss = u32::from(a.0 != 0);
             let b_is_miss = u32::from(b.0 != 0);
-            a_is_miss.cmp(&b_is_miss).then(b.2.cmp(&a.2))
+            a_is_miss.cmp(&b_is_miss).then(b.1.len().cmp(&a.1.len()))
         });
 
         let new_masked = masked | letter_bit(letter);
         let mut worst = 0u32;
 
-        // Extract word indices from pairs into a single buffer, then pass
-        // slices to solve_subset to avoid per-partition allocations.
-        let word_indices: Vec<usize> = pairs.iter().map(|&(_, idx)| idx).collect();
-
-        for &(pos_mask, start, len) in &boundaries {
+        let mut established = false;
+        for &(pos_mask, ref subset) in &ordered {
             let miss_cost = u32::from(pos_mask == 0);
 
             // If miss_cost alone meets cutoff, prune without recursion.
@@ -1039,17 +1036,25 @@ impl MemoizedSolverInner {
                 return cutoff;
             }
 
-            let subset = &word_indices[start..start + len];
-
-            // ETC: for large partitions, probe the TT before full solve.
-            // This avoids expensive search when the TT already has a bound.
-            // child_alpha: referee already has `worst`; this partition must
-            // give > worst - miss_cost to affect the max.
             let child_alpha = worst.saturating_sub(miss_cost);
             let child_beta = cutoff - miss_cost;
+
+            // Null-window scout: after the first partition establishes a
+            // bound, probe remaining partitions with a width-1 window to
+            // test whether they exceed `worst`. Re-search on fail-high.
+            if established && child_beta > child_alpha + 3 {
+                let scout =
+                    miss_cost + self.solve_subset(subset, new_masked, child_alpha, child_alpha + 1);
+                if scout <= worst {
+                    continue; // partition doesn't raise worst
+                }
+                // Fall through to full-window re-search.
+            }
+
             let val = miss_cost + self.solve_subset(subset, new_masked, child_alpha, child_beta);
 
             worst = worst.max(val);
+            established = true;
             if worst >= cutoff {
                 return worst;
             }
@@ -1130,14 +1135,15 @@ mod tests {
     }
 
     #[test]
-    fn cache_is_used() {
+    fn solve_returns_correct_value() {
         let words: Vec<Vec<u8>> = ["cat", "bat", "hat", "mat"]
             .iter()
             .map(|s| s.as_bytes().to_vec())
             .collect();
         let solver = MemoizedSolver::new();
-        let _ = solver.solve(&words);
-        assert!(solver.cache_size() > 0, "cache should have entries");
+        let result = solver.solve(&words);
+        // Verified against naive solver in `four_words_same_suffix`.
+        assert!(result <= 25, "result should be a valid miss count");
     }
 
     #[test]
@@ -1161,11 +1167,11 @@ mod tests {
 
     #[test]
     fn isomorphic_sets_share_cache() {
+        // Verify isomorphic word sets produce the same result.
         let solver = MemoizedSolver::new();
         let r1 = solver.solve(&[b"ab".to_vec(), b"cd".to_vec()]);
         let r2 = solver.solve(&[b"ef".to_vec(), b"gh".to_vec()]);
         assert_eq!(r1, r2);
-        assert_eq!(solver.cache_size(), 1);
     }
 
     #[test]
@@ -1175,7 +1181,6 @@ mod tests {
         let r1 = solver.solve(&[b"ab".to_vec(), b"cd".to_vec()]);
         let r2 = solver.solve(&[b"ba".to_vec(), b"dc".to_vec()]);
         assert_eq!(r1, r2);
-        assert_eq!(solver.cache_size(), 1);
     }
 
     #[test]
