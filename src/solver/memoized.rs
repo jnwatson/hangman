@@ -1,12 +1,42 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::Instant;
 
 use dashmap::DashMap;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use super::canon::dedup_and_hash;
+use super::disk_cache::DiskCache;
 use crate::game::{LetterSet, letter_bit};
+
+// ---------------------------------------------------------------------------
+// Progress tracking — live ETA estimation during long solves.
+// ---------------------------------------------------------------------------
+
+/// A snapshot of one ply level in the search.
+#[derive(Clone, Debug)]
+pub struct ProgressFrame {
+    /// When this ply started (seconds since solve start).
+    pub start_secs: f64,
+    /// Total letters to try at this level.
+    pub total_moves: u32,
+    /// Letters fully evaluated so far.
+    pub completed_moves: u32,
+}
+
+/// Current solver progress, readable while the solve is running.
+#[derive(Clone, Debug)]
+pub struct ProgressSnapshot {
+    /// Stack of active frames (index 0 = shallowest ply).
+    pub frames: Vec<ProgressFrame>,
+    /// Seconds since solve started.
+    pub elapsed_secs: f64,
+    /// Current MTD(f) iteration (0 = first, or non-MTD(f) mode).
+    pub mtd_iteration: u32,
+    /// Duration of completed non-trivial MTD(f) iterations (seconds).
+    pub iter_durations: Vec<f64>,
+}
 
 /// Memoized minimax solver with structural caching, alpha-beta pruning,
 /// move ordering, and position canonicalization.
@@ -48,6 +78,10 @@ pub struct MemoizedSolver {
     cache: DashMap<u128, u32>,
     hash_calls: AtomicU64,
     cache_hits: AtomicU64,
+    /// Reference to the currently active solve's data (for progress reading).
+    active_data: std::sync::Mutex<Option<Arc<SolverData>>>,
+    /// Optional on-disk cache (LMDB) for persisted EXACT entries.
+    disk_cache: Option<Arc<DiskCache>>,
 }
 
 /// Parallelism threshold: nodes with at least this many words use rayon.
@@ -73,7 +107,7 @@ fn cache_pack(value: u32, best_letter: u8, bound: u32) -> u32 {
 }
 
 #[inline]
-fn cache_unpack(packed: u32) -> (u32, Option<u8>, u32) {
+pub(super) fn cache_unpack(packed: u32) -> (u32, Option<u8>, u32) {
     let value = packed & VALUE_MASK;
     let letter_idx = (packed >> LETTER_SHIFT) & 0x1F;
     let best_letter = if letter_idx < 26 {
@@ -92,7 +126,30 @@ impl MemoizedSolver {
             cache: DashMap::new(),
             hash_calls: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
+            active_data: std::sync::Mutex::new(None),
+            disk_cache: None,
         }
+    }
+
+    /// Create a solver backed by an on-disk LMDB cache.
+    ///
+    /// The disk cache is checked as an L2 fallback when the in-memory
+    /// transposition table misses. Only EXACT entries are stored on disk.
+    #[must_use]
+    pub fn with_disk_cache(disk: Arc<DiskCache>) -> Self {
+        Self {
+            cache: DashMap::new(),
+            hash_calls: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            active_data: std::sync::Mutex::new(None),
+            disk_cache: Some(disk),
+        }
+    }
+
+    /// Access the in-memory cache (for serialization to disk).
+    #[must_use]
+    pub fn cache(&self) -> &DashMap<u128, u32> {
+        &self.cache
     }
 
     /// Solve for the given word list. All words must be the same length.
@@ -108,30 +165,69 @@ impl MemoizedSolver {
     #[must_use]
     pub fn solve(&self, words: &[Vec<u8>]) -> u32 {
         assert!(!words.is_empty());
-        let data = Arc::new(SolverData::new(words.to_vec()));
+        let data = Arc::new(SolverData::new(words.to_vec(), self.disk_cache.clone()));
+        *self.active_data.lock().unwrap() = Some(Arc::clone(&data));
         let indices: Vec<usize> = (0..words.len()).collect();
 
-        let result = if words.len() <= 25_000 {
-            // MTD(f)-style iterative deepening for medium word lists.
-            let solver = MemoizedSolverInner::new(Arc::clone(&data), 0, true);
-            let mut result = 0;
-            for target in 0..26u32 {
-                result = solver.solve_subset(&indices, 0, 0, target + 1);
-                if result <= target {
-                    break;
-                }
-            }
-            result
+        let n_extra = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            / 4;
+        // MTD(f) path benefits from more helpers warming the TT; pure Lazy
+        // SMP has diminishing returns (DashMap contention). Tune independently.
+        let n_extra = if words.len() <= 25_000 {
+            n_extra.clamp(1, 7)
         } else {
-            // Lazy SMP: primary thread uses rayon (YBWC) for internal
+            n_extra.clamp(1, 2)
+        };
+
+        let result = if words.len() <= 25_000 {
+            // MTD(f) + Lazy SMP hybrid: all threads do iterative deepening
+            // with perturbed move ordering, sharing a transposition table.
+            // Main thread uses rayon (YBWC) for internal parallelism.
+            std::thread::scope(|s| {
+                // Launch helpers with full-window search and perturbed ordering.
+                // The main thread's iterative deepening warms the TT, which
+                // helps helpers find cutoffs faster.
+                #[allow(clippy::cast_possible_truncation)]
+                let _helpers: Vec<_> = (1..=n_extra as u32)
+                    .map(|tid| {
+                        let data = Arc::clone(&data);
+                        let indices = indices.clone();
+                        s.spawn(move || {
+                            let solver = MemoizedSolverInner::new(data, tid, false);
+                            solver.solve_subset(&indices, 0, 0, u32::MAX)
+                        })
+                    })
+                    .collect();
+
+                // Main thread: MTD(f) iterative deepening with explicit alpha.
+                let solver = MemoizedSolverInner::new(Arc::clone(&data), 0, true);
+                let mut result = 0;
+                let mut lo = 0u32;
+                for (iter, target) in (0..26u32).enumerate() {
+                    #[allow(clippy::cast_possible_truncation)]
+                    data.mtd_iteration.store(iter as u32, Ordering::Relaxed);
+                    let iter_start = Instant::now();
+                    result = solver.solve_subset(&indices, 0, lo, target + 1);
+                    let iter_secs = iter_start.elapsed().as_secs_f64();
+                    if iter_secs > 0.01 {
+                        data.iter_durations.lock().unwrap().push(iter_secs);
+                    }
+                    if result <= target {
+                        break;
+                    }
+                    lo = result;
+                }
+
+                // Signal helpers to stop and wait for them.
+                data.cancelled.store(true, Ordering::Relaxed);
+                result
+            })
+        } else {
+            // Pure Lazy SMP: primary thread uses rayon (YBWC) for internal
             // parallelism; extra sequential threads explore with perturbed
             // orderings, sharing the TT for mutual pruning.
-            let n_extra = std::thread::available_parallelism()
-                .map(std::num::NonZero::get)
-                .unwrap_or(1)
-                / 4;
-            let n_extra = n_extra.clamp(1, 3);
-
             std::thread::scope(|s| {
                 #[allow(clippy::cast_possible_truncation)]
                 let handles: Vec<_> = (1..=n_extra as u32)
@@ -171,6 +267,7 @@ impl MemoizedSolver {
             }
         }
 
+        *self.active_data.lock().unwrap() = None;
         result
     }
 
@@ -188,61 +285,96 @@ impl MemoizedSolver {
     #[must_use]
     pub fn solve_bounded(&self, words: &[Vec<u8>], max_misses: u32) -> u32 {
         assert!(!words.is_empty());
-        let data = Arc::new(SolverData::new(words.to_vec()));
+        let data = Arc::new(SolverData::new(words.to_vec(), self.disk_cache.clone()));
         // Seed with any exact entries from prior calls.
         for entry in &self.cache {
             data.cache.insert(*entry.key(), *entry.value());
         }
+        *self.active_data.lock().unwrap() = Some(Arc::clone(&data));
         let indices: Vec<usize> = (0..words.len()).collect();
 
-        let result = if words.len() <= 25_000 {
-            let solver = MemoizedSolverInner::new(Arc::clone(&data), 0, true);
-            solver.solve_subset(&indices, 0, 0, max_misses + 1)
+        let n_extra = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            / 4;
+        let n_extra = if words.len() <= 25_000 {
+            n_extra.clamp(1, 7)
         } else {
-            let n_extra = std::thread::available_parallelism()
-                .map(std::num::NonZero::get)
-                .unwrap_or(1)
-                / 4;
-            let n_extra = n_extra.clamp(1, 3);
-
-            std::thread::scope(|s| {
-                #[allow(clippy::cast_possible_truncation)]
-                let handles: Vec<_> = (1..=n_extra as u32)
-                    .map(|tid| {
-                        let data = Arc::clone(&data);
-                        let indices = indices.clone();
-                        s.spawn(move || {
-                            let solver = MemoizedSolverInner::new(data, tid, false);
-                            solver.solve_subset(&indices, 0, 0, max_misses + 1)
-                        })
-                    })
-                    .collect();
-
-                let main_result = {
-                    let solver = MemoizedSolverInner::new(Arc::clone(&data), 0, true);
-                    solver.solve_subset(&indices, 0, 0, max_misses + 1)
-                };
-
-                let mut best = main_result;
-                for h in handles {
-                    best = best.min(h.join().unwrap());
-                }
-                best
-            })
+            n_extra.clamp(1, 2)
         };
+
+        let result = std::thread::scope(|s| {
+            // Launch SMP helper threads with the same budget.
+            #[allow(clippy::cast_possible_truncation)]
+            let _helpers: Vec<_> = (1..=n_extra as u32)
+                .map(|tid| {
+                    let data = Arc::clone(&data);
+                    let indices = indices.clone();
+                    s.spawn(move || {
+                        let solver = MemoizedSolverInner::new(data, tid, false);
+                        solver.solve_subset(&indices, 0, 0, max_misses + 1)
+                    })
+                })
+                .collect();
+
+            let solver = MemoizedSolverInner::new(Arc::clone(&data), 0, true);
+            let result = solver.solve_subset(&indices, 0, 0, max_misses + 1);
+
+            // Signal helpers to stop.
+            data.cancelled.store(true, Ordering::Relaxed);
+            result
+        });
 
         self.hash_calls
             .fetch_add(data.hash_calls.load(Ordering::Relaxed), Ordering::Relaxed);
         self.cache_hits
             .fetch_add(data.cache_hits.load(Ordering::Relaxed), Ordering::Relaxed);
+        // Preserve all TT entries (including lower/upper bounds) across calls.
+        // Lower bounds from prior iterations provide tighter alpha for future
+        // iterations, and upper bounds provide tighter beta.
         for entry in &data.cache {
-            let (_, _, bound) = cache_unpack(*entry.value());
-            if bound == BOUND_EXACT {
-                self.cache.insert(*entry.key(), *entry.value());
+            let (val, _, bound) = cache_unpack(*entry.value());
+            let key = *entry.key();
+            if let Some(existing) = self.cache.get(&key) {
+                let (old_val, _, old_bound) = cache_unpack(*existing);
+                // Exact always wins. Otherwise keep the tighter bound.
+                if bound == BOUND_EXACT
+                    || (old_bound != BOUND_EXACT
+                        && ((bound == BOUND_LOWER && val > old_val)
+                            || (bound == BOUND_UPPER && val < old_val)))
+                {
+                    drop(existing);
+                    self.cache.insert(key, *entry.value());
+                }
+            } else {
+                self.cache.insert(key, *entry.value());
             }
         }
 
+        *self.active_data.lock().unwrap() = None;
         result
+    }
+
+    /// Read the current progress of an active solve. Returns `None` if no
+    /// solve is in progress or the progress stack is empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn progress(&self) -> Option<ProgressSnapshot> {
+        let guard = self.active_data.lock().unwrap();
+        let data = guard.as_ref()?;
+        let stack = data.progress.lock().unwrap();
+        if stack.is_empty() {
+            return None;
+        }
+        Some(ProgressSnapshot {
+            frames: stack.clone(),
+            elapsed_secs: data.solve_start.elapsed().as_secs_f64(),
+            mtd_iteration: data.mtd_iteration.load(Ordering::Relaxed),
+            iter_durations: data.iter_durations.lock().unwrap().clone(),
+        })
     }
 
     #[must_use]
@@ -286,13 +418,36 @@ struct SolverData {
     key_cache: DashMap<u64, u128>,
     hash_calls: AtomicU64,
     cache_hits: AtomicU64,
-    /// Letters ranked by descending frequency (how many words contain each).
-    /// Precomputed once; used for O(1) move ordering at every node.
-    freq_order: [u8; 26],
+    /// Frequency rank: `freq_rank[letter_idx]` = rank (0 = most frequent).
+    /// Used as tiebreaker when history scores are equal (cold start).
+    freq_rank: [u8; 26],
+    /// History heuristic: tracks which letters have been empirically good
+    /// (best move or cutoff-causing) across the search. Used for dynamic
+    /// move ordering — letters with high history scores are tried earlier.
+    history: [AtomicU32; 26],
+    /// Cancellation flag: when set, helper threads should exit early.
+    cancelled: AtomicBool,
+    /// Progress stack for ETA estimation. Only written by the main OS thread,
+    /// read by an external reporter. The Mutex is uncontested during solving
+    /// and only briefly held when reading.
+    progress: std::sync::Mutex<Vec<ProgressFrame>>,
+    /// Solve start time for computing progress frame offsets.
+    solve_start: Instant,
+    /// ID of the thread that created this data (the main solve thread).
+    /// Only this thread updates the progress stack, avoiding corruption
+    /// from rayon workers that share the same perturbation value.
+    main_thread_id: std::thread::ThreadId,
+    /// Current MTD(f) iteration number (0-indexed).
+    mtd_iteration: AtomicU32,
+    /// Duration of each completed MTD(f) iteration (seconds).
+    /// Only non-trivial iterations (> 10ms) are recorded.
+    iter_durations: std::sync::Mutex<Vec<f64>>,
+    /// Optional on-disk L2 cache.
+    disk_cache: Option<Arc<DiskCache>>,
 }
 
 impl SolverData {
-    fn new(words: Vec<Vec<u8>>) -> Self {
+    fn new(words: Vec<Vec<u8>>, disk_cache: Option<Arc<DiskCache>>) -> Self {
         let n = words.len();
         let mut pos_masks = vec![vec![0u32; n]; 26];
         let mut word_letters = vec![0u32; n];
@@ -314,11 +469,16 @@ impl SolverData {
                 }
             }
         }
+        // Compute frequency ranks: sort letters by count descending,
+        // then assign rank 0 to most frequent.
         #[allow(clippy::cast_possible_truncation)]
-        let mut freq_order: [u8; 26] = std::array::from_fn(|i| b'a' + i as u8);
-        freq_order.sort_by(|&a, &b| {
-            letter_counts[(b - b'a') as usize].cmp(&letter_counts[(a - b'a') as usize])
-        });
+        let mut freq_order: Vec<(usize, u32)> = letter_counts.iter().copied().enumerate().collect();
+        freq_order.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut freq_rank = [0u8; 26];
+        for (rank, &(li, _)) in freq_order.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            { freq_rank[li] = rank as u8; }
+        }
 
         Self {
             words,
@@ -328,7 +488,15 @@ impl SolverData {
             key_cache: DashMap::new(),
             hash_calls: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
-            freq_order,
+            freq_rank,
+            history: std::array::from_fn(|_| AtomicU32::new(0)),
+            cancelled: AtomicBool::new(false),
+            progress: std::sync::Mutex::new(Vec::new()),
+            solve_start: Instant::now(),
+            main_thread_id: std::thread::current().id(),
+            mtd_iteration: AtomicU32::new(0),
+            iter_durations: std::sync::Mutex::new(Vec::new()),
+            disk_cache,
         }
     }
 }
@@ -379,6 +547,8 @@ impl MemoizedSolverInner {
         }
         present & !masked
     }
+
+
 
     /// Fast path for exactly 2 distinct words.
     ///
@@ -558,31 +728,33 @@ impl MemoizedSolverInner {
         indices: &[usize],
         mut masked: LetterSet,
     ) -> (LetterSet, LetterSet) {
+        // Fast path: compute word_letters intersection to find required letters.
+        // Bail early when intersection drops to zero (no required letters) —
+        // this is the common case and avoids the O(26) letter-by-letter scan.
+        let mut intersection = u32::MAX;
+        for &idx in indices {
+            intersection &= self.data.word_letters[idx];
+            if intersection & !masked == 0 {
+                return (masked, 0);
+            }
+        }
+        let candidates = intersection & !masked;
+
+        // Only check letters that are in ALL words (typically 0-5).
         let mut required_splitting: LetterSet = 0;
-        for li in 0..26u8 {
+        let mut bits = candidates;
+        while bits != 0 {
+            #[allow(clippy::cast_possible_truncation)]
+            let li = bits.trailing_zeros() as u8;
+            bits &= bits - 1;
             let letter = b'a' + li;
-            if masked & letter_bit(letter) != 0 {
-                continue;
-            }
             let first_mask = self.pos_mask_for(indices[0], letter);
-            if first_mask == 0 {
-                continue; // not in first word → can't be in all
-            }
-            let all_match = indices[1..]
-                .iter()
-                .all(|&idx| self.pos_mask_for(idx, letter) != 0);
-            if !all_match {
-                continue; // not required
-            }
-            // Letter is required (in all words). Check if it splits.
             let all_same_mask = indices[1..]
                 .iter()
                 .all(|&idx| self.pos_mask_for(idx, letter) == first_mask);
             if all_same_mask {
-                // Non-splitting: free guess, add to masked.
                 masked |= letter_bit(letter);
             } else {
-                // Splitting: evaluate this letter (and only required letters).
                 required_splitting |= letter_bit(letter);
             }
         }
@@ -625,6 +797,13 @@ impl MemoizedSolverInner {
                 alpha,
                 beta,
             }
+        } else if let Some(packed) = self.data.disk_cache.as_ref().and_then(|dc| dc.get(key)) {
+            // Disk cache only stores EXACT entries.
+            let (val, _, _) = cache_unpack(packed);
+            // Promote to in-memory cache for fast subsequent lookups.
+            self.data.cache.insert(key, packed);
+            self.data.cache_hits.fetch_add(1, Ordering::Relaxed);
+            CacheLookup::Hit(val)
         } else {
             CacheLookup::Miss {
                 tt_move: None,
@@ -654,41 +833,59 @@ impl MemoizedSolverInner {
             return vec![];
         }
         let n_candidates = candidate_mask.count_ones();
-        // Few candidates: frequency order is good enough.
+        // Few candidates: sort by history score with frequency tiebreaker.
         if n_candidates <= 6 {
-            return self
-                .data
-                .freq_order
-                .iter()
-                .copied()
-                .filter(|&letter| candidate_mask & letter_bit(letter) != 0)
+            let mut letters: Vec<u8> = (0..26u8)
+                .filter(|&i| candidate_mask & (1 << i) != 0)
+                .map(|i| b'a' + i)
                 .collect();
+            letters.sort_by(|&a, &b| {
+                let ha = self.data.history[(a - b'a') as usize].load(Ordering::Relaxed);
+                let hb = self.data.history[(b - b'a') as usize].load(Ordering::Relaxed);
+                hb.cmp(&ha).then_with(|| {
+                    self.data.freq_rank[(a - b'a') as usize]
+                        .cmp(&self.data.freq_rank[(b - b'a') as usize])
+                })
+            });
+            return letters;
         }
-        // Score only the first batch of candidates by partition size.
-        // The rest go at the end in frequency order (unscored).
+        // Score the first batch of candidates by partition size.
+        // Select candidates for scoring using history (best-historically
+        // letters are most likely to also have good partition sizes).
         let batch_size = 8;
+
+        // Build candidate list sorted by history (descending), freq tiebreaker.
+        let mut candidates: Vec<(u8, u32, u8)> = (0..26u8)
+            .filter(|&i| candidate_mask & (1 << i) != 0)
+            .map(|i| {
+                let letter = b'a' + i;
+                let hist = self.data.history[i as usize].load(Ordering::Relaxed);
+                let rank = self.data.freq_rank[i as usize];
+                (letter, hist, rank)
+            })
+            .collect();
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+
         let mut counts: FxHashMap<u32, usize> = FxHashMap::default();
         let mut scored: Vec<(u8, usize)> = Vec::with_capacity(batch_size);
         let mut remaining: Vec<u8> = Vec::new();
-        for &letter in &self.data.freq_order {
-            if candidate_mask & letter_bit(letter) == 0 {
-                continue;
-            }
+        for (letter, _, _) in &candidates {
             if scored.len() < batch_size {
                 counts.clear();
                 let mut max_part = 0usize;
                 for &idx in indices {
-                    let mask = self.pos_mask_for(idx, letter);
+                    let mask = self.pos_mask_for(idx, *letter);
                     let count = counts.entry(mask).or_insert(0);
                     *count += 1;
                     max_part = max_part.max(*count);
                 }
-                scored.push((letter, max_part));
+                scored.push((*letter, max_part));
             } else {
-                remaining.push(letter);
+                remaining.push(*letter);
             }
         }
         scored.sort_by_key(|&(_, mp)| mp);
+        // remaining is already in history order (descending) from candidates.
         let mut result: Vec<u8> = scored.into_iter().map(|(letter, _)| letter).collect();
         result.extend(remaining);
         result
@@ -702,27 +899,47 @@ impl MemoizedSolverInner {
     fn miss_chain_lower_bound(
         &self,
         indices: &[usize],
+        masked: LetterSet,
+        max_depth: u32,
+    ) -> u32 {
+        // At the top level, `masked` already has non-splitting required letters
+        // folded in (from analyze_required_letters), so we skip the redundant
+        // required-letter scan. Recursive calls still need it since we haven't
+        // pre-analyzed those subsets.
+        self.miss_chain_lb_inner(indices, masked, max_depth, true)
+    }
+
+    fn miss_chain_lb_inner(
+        &self,
+        indices: &[usize],
         mut masked: LetterSet,
         max_depth: u32,
+        skip_required_scan: bool,
     ) -> u32 {
         if indices.len() <= 1 || max_depth == 0 {
             return 0;
         }
 
-        // Collapse required letters (in all words) — free, no miss risk.
-        for li in 0..26u8 {
-            let letter = b'a' + li;
-            if masked & letter_bit(letter) != 0 {
-                continue;
+        if !skip_required_scan {
+            // Collapse required letters (in all words) — free, no miss risk.
+            let mut intersection = u32::MAX;
+            for &idx in indices {
+                intersection &= self.data.word_letters[idx];
+                if intersection & !masked == 0 {
+                    break;
+                }
             }
-            let first_mask = self.pos_mask_for(indices[0], letter);
-            if first_mask == 0 {
-                continue;
-            }
-            if indices[1..]
-                .iter()
-                .all(|&idx| self.pos_mask_for(idx, letter) != 0)
-            {
+            let candidates = intersection & !masked;
+            let mut bits = candidates;
+            while bits != 0 {
+                #[allow(clippy::cast_possible_truncation)]
+                let li = bits.trailing_zeros() as u8;
+                bits &= bits - 1;
+                let letter = b'a' + li;
+                // Check if it's actually required (present in all words, not
+                // just in the intersection of word_letters which could include
+                // masked letters). Since we filtered by !masked, all
+                // intersection bits are unmasked. Just mask them.
                 masked |= letter_bit(letter);
             }
         }
@@ -751,8 +968,8 @@ impl MemoizedSolverInner {
             if miss.len() <= 1 {
                 return 1;
             }
-            let val =
-                1 + self.miss_chain_lower_bound(&miss, masked | letter_bit(letter), max_depth - 1);
+            let val = 1
+                + self.miss_chain_lb_inner(&miss, masked | letter_bit(letter), max_depth - 1, false);
             best = best.min(val);
             if best <= 1 {
                 break;
@@ -778,9 +995,16 @@ impl MemoizedSolverInner {
         h ^ (h >> 33)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn solve_subset(&self, indices: &[usize], masked: LetterSet, alpha: u32, beta: u32) -> u32 {
         if indices.len() <= 1 || beta == 0 {
             return 0;
+        }
+        // Early exit if another thread has found the answer.
+        // Return beta (pessimistic) so this value doesn't get cached as a
+        // good result that poisons the TT.
+        if self.data.cancelled.load(Ordering::Relaxed) {
+            return beta;
         }
 
         // Analyze required letters: collapse non-splitting ones (free guesses)
@@ -789,12 +1013,29 @@ impl MemoizedSolverInner {
         let (masked, required_splitting) = self.analyze_required_letters(indices, masked);
 
         // Quick pruning via miss-chain lower bound before expensive canonicalization.
-        // When no letter is required, the referee can always force misses.
-        if required_splitting == 0 && indices.len() >= 5000 {
-            let depth = if indices.len() >= 40_000 { 3 } else { 2 };
-            let lb = self.miss_chain_lower_bound(indices, masked, depth);
-            if lb >= beta {
-                return lb;
+        // When no required-splitting letters exist, every unmasked letter risks a
+        // miss — the referee can always pick the miss partition.
+        //
+        // Depth=1 proves lb >= 1 for free (no allocation needed): after
+        // analyze_required_letters folded non-splitting required letters into
+        // masked, any remaining present letter must miss on some word. So if
+        // present != 0, the guesser faces at least 1 miss no matter what.
+        //
+        // Depth=2-3 for large nodes catches deeper miss chains but is expensive.
+        if required_splitting == 0 && indices.len() >= 5 {
+            if indices.len() >= 5000 {
+                let depth = if indices.len() >= 40_000 { 3 } else { 2 };
+                let lb = self.miss_chain_lower_bound(indices, masked, depth);
+                if lb >= beta {
+                    return lb;
+                }
+            }
+            // Depth=1 fast path: lb is exactly 1 if any present letter exists.
+            if beta <= 1 {
+                let present = self.present_letters(indices, masked);
+                if present != 0 {
+                    return 1;
+                }
             }
         }
 
@@ -888,11 +1129,40 @@ impl MemoizedSolverInner {
             letters[..=pos].rotate_right(1);
         }
 
+        // Progress tracking: only the main OS thread pushes frames, at large
+        // nodes only. Rayon workers share perturbation==0 but run on different
+        // threads, so checking the thread ID prevents stack corruption.
+        let tracking = self.perturbation == 0
+            && indices.len() >= PAR_THRESHOLD
+            && std::thread::current().id() == self.data.main_thread_id;
+        if tracking {
+            let frame = ProgressFrame {
+                start_secs: self.data.solve_start.elapsed().as_secs_f64(),
+                #[allow(clippy::cast_possible_truncation)]
+                total_moves: letters.len() as u32,
+                completed_moves: 0,
+            };
+            self.data.progress.lock().unwrap().push(frame);
+        }
+
         let (best, best_letter) = if self.use_rayon && indices.len() >= PAR_THRESHOLD {
             self.solve_parallel(&letters, &indices, masked, alpha, beta)
         } else {
             self.solve_sequential(&letters, &indices, masked, alpha, beta)
         };
+
+        if tracking {
+            self.data.progress.lock().unwrap().pop();
+        }
+
+        // History heuristic: boost the best letter's score, weighted by
+        // word count (larger nodes → more pruning value from good ordering).
+        if best_letter != 0 {
+            #[allow(clippy::cast_possible_truncation)]
+            let bonus = (indices.len() / 10).clamp(1, 100) as u32;
+            self.data.history[(best_letter - b'a') as usize]
+                .fetch_add(bonus, Ordering::Relaxed);
+        }
 
         self.cache_store(cache_key, best, best_letter, alpha, beta);
         best
@@ -900,6 +1170,10 @@ impl MemoizedSolverInner {
 
     /// Store a result in the cache with correct bound type.
     fn cache_store(&self, key: u128, best: u32, best_letter: u8, alpha: u32, beta: u32) {
+        // Don't cache results from cancelled searches — values are unreliable.
+        if self.data.cancelled.load(Ordering::Relaxed) {
+            return;
+        }
         if best <= alpha {
             // Upper bound — value is at most `best`. Never overwrite exact.
             let packed = cache_pack(best, best_letter, BOUND_UPPER);
@@ -939,6 +1213,8 @@ impl MemoizedSolverInner {
         alpha: u32,
         beta: u32,
     ) -> (u32, u8) {
+        let tracking = self.perturbation == 0
+            && std::thread::current().id() == self.data.main_thread_id;
         let mut best = u32::MAX;
         let mut best_letter = letters[0];
         for &letter in letters {
@@ -947,6 +1223,11 @@ impl MemoizedSolverInner {
             if val < best {
                 best = val;
                 best_letter = letter;
+            }
+            if tracking
+                && let Some(frame) = self.data.progress.lock().unwrap().last_mut()
+            {
+                frame.completed_moves += 1;
             }
             if best <= alpha || best == 0 {
                 break;
@@ -965,10 +1246,18 @@ impl MemoizedSolverInner {
         alpha: u32,
         beta: u32,
     ) -> (u32, u8) {
+        let tracking = self.perturbation == 0
+            && std::thread::current().id() == self.data.main_thread_id;
         // Evaluate first letter sequentially to get a tight initial bound.
         let first_val = self.evaluate_letter(indices, masked, letters[0], beta);
         let mut best = first_val;
         let mut best_letter = letters[0];
+
+        if tracking
+            && let Some(frame) = self.data.progress.lock().unwrap().last_mut()
+        {
+            frame.completed_moves += 1;
+        }
 
         if best <= alpha || best == 0 || letters.len() <= 1 {
             return (best, best_letter);
@@ -991,6 +1280,13 @@ impl MemoizedSolverInner {
                 || (u32::MAX, 0),
                 |(v1, l1), (v2, l2)| if v1 <= v2 { (v1, l1) } else { (v2, l2) },
             );
+
+        // Mark all remaining letters as completed after parallel section.
+        if tracking
+            && let Some(frame) = self.data.progress.lock().unwrap().last_mut()
+        {
+            frame.completed_moves = frame.total_moves;
+        }
 
         if rest.0 < best {
             best = rest.0;
@@ -1034,6 +1330,33 @@ impl MemoizedSolverInner {
             // If miss_cost alone meets cutoff, prune without recursion.
             if miss_cost >= cutoff {
                 return cutoff;
+            }
+
+            // Fast inline resolution for tiny partitions (avoids solve_subset
+            // overhead: analyze_required, fast_index_key, dedup_and_hash, TT).
+            if subset.len() <= 1 {
+                worst = worst.max(miss_cost);
+                established = true;
+                if worst >= cutoff {
+                    return worst;
+                }
+                continue;
+            }
+            if subset.len() == 2 {
+                let val = miss_cost + self.solve_two_words(subset[0], subset[1], new_masked);
+                worst = worst.max(val);
+                established = true;
+                if worst >= cutoff {
+                    return worst;
+                }
+                continue;
+            }
+
+            // Cheap upper bound: partition value ≤ number of present unmasked
+            // letters. Skip if that can't raise worst.
+            let n_useful = self.present_letters(subset, new_masked).count_ones();
+            if miss_cost + n_useful <= worst {
+                continue;
             }
 
             let child_alpha = worst.saturating_sub(miss_cost);

@@ -1,16 +1,18 @@
 #![deny(clippy::all, clippy::pedantic)]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
 
 use hangman2::dictionary::Dictionary;
-use hangman2::solver::{DagSolver, MemoizedSolver, NaiveSolver};
+use hangman2::solver::{DagSolver, DiskCache, MemoizedSolver, NaiveSolver, ProgressSnapshot};
 
 #[derive(Parser)]
 #[command(name = "bench", about = "Benchmark the hangman solver")]
+#[allow(clippy::struct_excessive_bools)]
 struct Cli {
     /// Path to dictionary file
     #[arg(short, long)]
@@ -43,6 +45,18 @@ struct Cli {
     /// Time budget in seconds for estimation (default: 60)
     #[arg(long, default_value = "60")]
     estimate_budget: u64,
+
+    /// Save TT to disk (LMDB) after solving each length
+    #[arg(long)]
+    save_cache: bool,
+
+    /// Load TT from disk (LMDB) before solving each length
+    #[arg(long)]
+    load_cache: bool,
+
+    /// Directory for disk cache databases
+    #[arg(long, default_value = "./tt_cache")]
+    cache_dir: PathBuf,
 }
 
 fn main() -> Result<()> {
@@ -56,7 +70,7 @@ fn main() -> Result<()> {
     if cli.estimate {
         run_estimate(&cli, &dict, &lengths);
     } else {
-        run_benchmark(&cli, &dict, &lengths);
+        run_benchmark(&cli, &dict, &lengths)?;
     }
 
     Ok(())
@@ -206,7 +220,8 @@ fn format_duration(secs: f64) -> String {
     }
 }
 
-fn run_benchmark(cli: &Cli, dict: &Dictionary, lengths: &[usize]) {
+#[allow(clippy::too_many_lines)]
+fn run_benchmark(cli: &Cli, dict: &Dictionary, lengths: &[usize]) -> Result<()> {
     if cli.dag {
         println!(
             "{:>6} {:>8} {:>8} {:>12} {:>8} {:>12} {:>8}",
@@ -249,19 +264,43 @@ fn run_benchmark(cli: &Cli, dict: &Dictionary, lengths: &[usize]) {
         let mut dag_cache = 0;
         if cli.dag {
             let start = Instant::now();
-            let dag = DagSolver::new(words.clone());
+            let dag = DagSolver::new(&words);
             let misses = dag.solve();
             dag_elapsed = start.elapsed();
             dag_cache = dag.cache_size();
             dag_misses = Some(misses);
         }
 
-        // Memoized solver
+        // Memoized solver — run in a thread so we can report progress.
+        let disk = if cli.load_cache || cli.save_cache {
+            let map_size = 16 * 1024 * 1024 * 1024; // 16 GB virtual
+            if cli.load_cache {
+                DiskCache::open_if_exists(&cli.cache_dir, *len, &words, map_size)?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(ref dc) = disk {
+            eprintln!("  loaded disk cache: {} entries", dc.entry_count());
+        }
+        let memo = Arc::new(if let Some(dc) = disk {
+            MemoizedSolver::with_disk_cache(Arc::new(dc))
+        } else {
+            MemoizedSolver::new()
+        });
         let start = Instant::now();
-        let memo = MemoizedSolver::new();
-        let memo_misses = memo.solve(&words);
+        let memo_misses = solve_with_progress(&memo, &words);
         let memo_elapsed = start.elapsed();
         let memo_cache = memo.cache_size();
+
+        if cli.save_cache {
+            let map_size = 16 * 1024 * 1024 * 1024;
+            let dc = DiskCache::open(&cli.cache_dir, *len, &words, map_size)?;
+            let saved = dc.save(memo.cache())?;
+            eprintln!("  saved {saved} exact entries to disk cache");
+        }
 
         if let Some(dm) = dag_misses {
             assert_eq!(
@@ -306,4 +345,135 @@ fn run_benchmark(cli: &Cli, dict: &Dictionary, lengths: &[usize]) {
             );
         }
     }
+    Ok(())
+}
+
+/// Run solver on the current thread, with a background reporter printing
+/// progress every few seconds.
+fn solve_with_progress(solver: &Arc<MemoizedSolver>, words: &[Vec<u8>]) -> u32 {
+    let pair = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+    // Spawn background reporter thread.
+    let reporter = {
+        let solver = Arc::clone(solver);
+        let pair = Arc::clone(&pair);
+        std::thread::spawn(move || {
+            let (lock, cvar) = &*pair;
+            loop {
+                let done = lock.lock().unwrap();
+                let (done, _) = cvar
+                    .wait_timeout(done, std::time::Duration::from_secs(5))
+                    .unwrap();
+                if *done {
+                    break;
+                }
+                drop(done);
+                if let Some(snap) = solver.progress() {
+                    let eta = estimate_remaining(&snap);
+                    print_live_progress(&snap, eta);
+                }
+            }
+        })
+    };
+
+    let result = solver.solve(words);
+
+    // Signal reporter to stop immediately.
+    let (lock, cvar) = &*pair;
+    *lock.lock().unwrap() = true;
+    cvar.notify_one();
+    let _ = reporter.join();
+    result
+}
+
+/// Estimate remaining time using MTD(f) iteration growth rates.
+///
+/// Each non-trivial MTD(f) iteration takes longer than the previous (wider
+/// window → more search). Given ≥2 completed iteration times, we compute
+/// the geometric mean of consecutive ratios as a growth factor, then
+/// estimate the current (in-progress) iteration's remaining time plus
+/// a few future iterations.
+///
+/// Falls back to frame-based estimate for non-MTD(f) solves (>25K words)
+/// or when insufficient iteration data exists.
+fn estimate_remaining(snap: &ProgressSnapshot) -> Option<f64> {
+    // For MTD(f): use iteration durations if available.
+    if snap.iter_durations.len() >= 2 {
+        return estimate_from_iterations(snap);
+    }
+
+    // Fallback: frame-based estimate for non-MTD(f) or early iterations.
+    let frame = snap.frames.first()?;
+    let done = f64::from(frame.completed_moves);
+    if done < 1.0 {
+        return None;
+    }
+    let total = f64::from(frame.total_moves);
+    let elapsed = snap.elapsed_secs - frame.start_secs;
+    if elapsed <= 0.0 {
+        return None;
+    }
+    Some(elapsed / done * (total - done))
+}
+
+/// Estimate remaining time from MTD(f) iteration growth pattern.
+///
+/// Estimates how long the current in-progress iteration will take based on
+/// the growth rate of previous iterations, then reports remaining time in
+/// this iteration. The last iteration dominates total solve time, so this
+/// is most accurate when it matters most.
+fn estimate_from_iterations(snap: &ProgressSnapshot) -> Option<f64> {
+    let durations = &snap.iter_durations;
+    if durations.len() < 2 {
+        return None;
+    }
+
+    // Compute growth factor from last ratio (most recent is most representative).
+    let last = durations[durations.len() - 1];
+    let prev = durations[durations.len() - 2];
+    if prev < 0.001 {
+        return None;
+    }
+    let growth = (last / prev).max(1.0);
+
+    // Estimate current iteration's total time.
+    let current_estimated = last * growth;
+
+    // Time spent in current iteration = elapsed - sum(completed iterations + trivial gaps).
+    let completed_sum: f64 = durations.iter().sum();
+    let current_elapsed = (snap.elapsed_secs - completed_sum).max(0.0);
+    let current_remaining = (current_estimated - current_elapsed).max(0.0);
+
+    Some(current_remaining)
+}
+
+fn print_live_progress(snap: &ProgressSnapshot, ema: Option<f64>) {
+    if snap.frames.is_empty() {
+        return;
+    }
+
+    // Show the progress stack: ply-by-ply [done/total].
+    let mut parts: Vec<String> = Vec::new();
+    for (i, frame) in snap.frames.iter().enumerate() {
+        parts.push(format!(
+            "{}[{}/{}]",
+            i, frame.completed_moves, frame.total_moves
+        ));
+        if i >= 7 {
+            parts.push("...".to_string());
+            break;
+        }
+    }
+
+    let elapsed = format_duration(snap.elapsed_secs);
+    let iter_str = if snap.mtd_iteration > 0 {
+        format!(" iter={}", snap.mtd_iteration)
+    } else {
+        String::new()
+    };
+    let eta = ema
+        .map(|r| format!("  ETA: {}", format_duration(r)))
+        .unwrap_or_default();
+
+    eprintln!("  [{elapsed}]{iter_str} {}{eta}", parts.join(" "));
 }
