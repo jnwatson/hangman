@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use super::canon::dedup_and_hash;
+use super::canon::{dedup_and_hash, dedup_only};
 use super::disk_cache::DiskCache;
 use crate::game::{LetterSet, letter_bit};
 
@@ -146,10 +146,125 @@ impl MemoizedSolver {
         }
     }
 
+    /// Copy all entries from another solver's persistent cache into this one.
+    pub fn copy_cache_from(&self, other: &MemoizedSolver) {
+        for entry in other.cache.iter() {
+            self.cache.insert(*entry.key(), *entry.value());
+        }
+    }
+
     /// Access the in-memory cache (for serialization to disk).
     #[must_use]
     pub fn cache(&self) -> &DashMap<u128, u32> {
         &self.cache
+    }
+
+    /// Flush all TT entries (EXACT, LOWER, UPPER) to the disk cache.
+    ///
+    /// After `solve()` returns, uses the persistent cache (`self.cache`).
+    /// During an active solve, uses the live solve cache (`active_data`).
+    ///
+    /// Returns the number of entries saved, or `None` if no disk cache.
+    pub fn flush_to_disk(&self) -> Option<anyhow::Result<usize>> {
+        let dc = self.disk_cache.as_ref()?;
+        // Try the active solve cache first (for mid-solve flushes).
+        let guard = self.active_data.lock().unwrap();
+        if let Some(data) = guard.as_ref() {
+            return Some(dc.save(&data.cache));
+        }
+        drop(guard);
+        // After solve() returns, active_data is None — use persistent cache.
+        Some(dc.save(&self.cache))
+    }
+
+    /// Flush all TT entries to disk, then clear the in-memory cache.
+    /// The disk cache continues to serve as L2 for subsequent lookups.
+    ///
+    /// Only works during an active solve (when `active_data` is set).
+    /// Returns the number of entries flushed, or `None` if no disk cache
+    /// or no active solve.
+    pub fn flush_and_evict(&self) -> Option<anyhow::Result<usize>> {
+        let dc = self.disk_cache.as_ref()?;
+        let guard = self.active_data.lock().unwrap();
+        let data = guard.as_ref()?;
+        let result = dc.save(&data.cache);
+        data.cache.clear();
+        Some(result)
+    }
+
+    /// Create a solver pre-initialized with word data for serving.
+    ///
+    /// Unlike `new()` or `with_disk_cache()`, this eagerly builds the internal
+    /// data structures (pos\_masks, word\_letters, etc.) so that subsequent
+    /// `solve_position` calls are fast.
+    #[must_use]
+    pub fn for_serving(words: Vec<Vec<u8>>, disk: Option<Arc<DiskCache>>) -> Self {
+        let data = Arc::new(SolverData::new(words, disk.clone()));
+        Self {
+            cache: DashMap::new(),
+            hash_calls: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            active_data: std::sync::Mutex::new(Some(data)),
+            disk_cache: disk,
+        }
+    }
+
+    /// Solve a specific subproblem: given word indices and already-masked
+    /// letters, compute the minimax value. Uses the disk cache as L2.
+    ///
+    /// This is designed for the game server: when a precomputed cache entry
+    /// is missing (e.g., the user made a non-optimal guess), this runs the
+    /// solver on-demand. With a well-populated disk cache, most internal
+    /// lookups hit and the solve completes quickly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the solver was not initialized via `for_serving`.
+    #[must_use]
+    pub fn solve_position(&self, indices: &[usize], masked: LetterSet) -> u32 {
+        if indices.len() <= 1 {
+            return 0;
+        }
+        let guard = self.active_data.lock().unwrap();
+        let data = Arc::clone(guard.as_ref().expect("solver not initialized for serving"));
+        drop(guard);
+
+        data.cancelled.store(false, Ordering::Relaxed);
+        let inner = MemoizedSolverInner::new(data, 0, false);
+        inner.solve_subset(indices, masked, 0, u32::MAX)
+    }
+
+    /// Warm the cache for serving: ensure every reachable position has an
+    /// EXACT entry. After calling `solve()`, the TT only has EXACT entries
+    /// for the optimal path. This method visits all positions reachable by
+    /// any sequence of user guesses (with optimal referee responses) and
+    /// solves any missing entries.
+    ///
+    /// Returns the number of new positions solved.
+    pub fn warm_serving_cache(&self, words: &[Vec<u8>]) -> usize {
+        let data = Arc::new(SolverData::new(words.to_vec(), self.disk_cache.clone()));
+        // Seed with all entries from the persistent cache.
+        for entry in &self.cache {
+            data.cache.insert(*entry.key(), *entry.value());
+        }
+        data.cancelled.store(false, Ordering::Relaxed);
+        *self.active_data.lock().unwrap() = Some(Arc::clone(&data));
+
+        let inner = MemoizedSolverInner::new(Arc::clone(&data), 0, false);
+        let indices: Vec<usize> = (0..words.len()).collect();
+        let mut solved = 0usize;
+        let mut visited = rustc_hash::FxHashSet::default();
+        inner.warm_recursive(&indices, 0, &mut solved, &mut visited);
+
+        // Transfer new EXACT entries to persistent cache.
+        for entry in &data.cache {
+            let (_, _, bound) = cache_unpack(*entry.value());
+            if bound == BOUND_EXACT {
+                self.cache.insert(*entry.key(), *entry.value());
+            }
+        }
+        *self.active_data.lock().unwrap() = None;
+        solved
     }
 
     /// Solve for the given word list. All words must be the same length.
@@ -220,6 +335,12 @@ impl MemoizedSolver {
                     lo = result;
                 }
 
+                // MTD(f) used narrow windows, so many TT entries are bounds
+                // rather than EXACT. Do one final full-window pass to convert
+                // them to EXACT (needed for disk cache persistence). The TT is
+                // warm from MTD(f), so this is very fast.
+                solver.solve_subset(&indices, 0, 0, result + 1);
+
                 // Signal helpers to stop and wait for them.
                 data.cancelled.store(true, Ordering::Relaxed);
                 result
@@ -259,11 +380,24 @@ impl MemoizedSolver {
             .fetch_add(data.hash_calls.load(Ordering::Relaxed), Ordering::Relaxed);
         self.cache_hits
             .fetch_add(data.cache_hits.load(Ordering::Relaxed), Ordering::Relaxed);
-        // Only transfer exact values to the persistent cache.
+        // Transfer all entries to the persistent cache. EXACT always wins;
+        // for bounds, keep the tighter value.
         for entry in &data.cache {
-            let (_, _, bound) = cache_unpack(*entry.value());
-            if bound == BOUND_EXACT {
-                self.cache.insert(*entry.key(), *entry.value());
+            let key = *entry.key();
+            let new_packed = *entry.value();
+            let (new_val, _, new_bound) = cache_unpack(new_packed);
+            if let Some(existing) = self.cache.get(&key) {
+                let (old_val, _, old_bound) = cache_unpack(*existing);
+                let dominated = new_bound == BOUND_EXACT
+                    || (old_bound != BOUND_EXACT
+                        && ((new_bound == BOUND_LOWER && new_val > old_val)
+                            || (new_bound == BOUND_UPPER && new_val < old_val)));
+                drop(existing);
+                if dominated {
+                    self.cache.insert(key, new_packed);
+                }
+            } else {
+                self.cache.insert(key, new_packed);
             }
         }
 
@@ -798,12 +932,39 @@ impl MemoizedSolverInner {
                 beta,
             }
         } else if let Some(packed) = self.data.disk_cache.as_ref().and_then(|dc| dc.get(key)) {
-            // Disk cache only stores EXACT entries.
-            let (val, _, _) = cache_unpack(packed);
             // Promote to in-memory cache for fast subsequent lookups.
             self.data.cache.insert(key, packed);
-            self.data.cache_hits.fetch_add(1, Ordering::Relaxed);
-            CacheLookup::Hit(val)
+            let (val, best_letter, bound) = cache_unpack(packed);
+            match bound {
+                BOUND_EXACT => {
+                    self.data.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    return CacheLookup::Hit(val);
+                }
+                BOUND_LOWER => {
+                    if val >= beta {
+                        self.data.cache_hits.fetch_add(1, Ordering::Relaxed);
+                        return CacheLookup::Hit(val);
+                    }
+                    alpha = alpha.max(val);
+                }
+                BOUND_UPPER => {
+                    if val <= alpha {
+                        self.data.cache_hits.fetch_add(1, Ordering::Relaxed);
+                        return CacheLookup::Hit(val);
+                    }
+                    beta = beta.min(val);
+                }
+                _ => {}
+            }
+            if alpha >= beta {
+                self.data.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return CacheLookup::Hit(val);
+            }
+            CacheLookup::Miss {
+                tt_move: best_letter,
+                alpha,
+                beta,
+            }
         } else {
             CacheLookup::Miss {
                 tt_move: None,
@@ -849,10 +1010,15 @@ impl MemoizedSolverInner {
             });
             return letters;
         }
-        // Score the first batch of candidates by partition size.
-        // Select candidates for scoring using history (best-historically
-        // letters are most likely to also have good partition sizes).
-        let batch_size = 8;
+        // Score candidates by partition size. For small word sets, score all
+        // candidates (cost is O(n_candidates × n), negligible when n is small).
+        // For larger sets, only score the top 8 by history.
+        let score_all = (n_candidates as usize) * indices.len() < 50_000;
+        let batch_size = if score_all {
+            n_candidates as usize
+        } else {
+            8
+        };
 
         // Build candidate list sorted by history (descending), freq tiebreaker.
         let mut candidates: Vec<(u8, u32, u8)> = (0..26u8)
@@ -1051,8 +1217,8 @@ impl MemoizedSolverInner {
             if let CacheLookup::Hit(val) = self.cache_lookup(canon_key, alpha, beta) {
                 return val;
             }
-            // TT miss: recompute deduped indices (cheaper than full cache).
-            let (deduped, _) = dedup_and_hash(&self.data.words, indices, masked);
+            // TT miss: only need deduped indices (skip canonicalization).
+            let deduped = dedup_only(&self.data.words, indices, masked);
             (deduped, canon_key)
         } else {
             let (deduped, canon_key) = dedup_and_hash(&self.data.words, indices, masked);
@@ -1305,7 +1471,9 @@ impl MemoizedSolverInner {
     ) -> u32 {
         // Group word indices by pos_mask using a hash map (O(n)) instead
         // of sorting (O(n log n)). Each partition is a (pos_mask, Vec<idx>).
-        let mut partitions: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+        // Pre-size to avoid rehashing — at most word_length+1 distinct masks.
+        let mut partitions: FxHashMap<u32, Vec<usize>> =
+            FxHashMap::with_capacity_and_hasher(32, Default::default());
         for &idx in indices {
             let mask = self.pos_mask_for(idx, letter);
             partitions.entry(mask).or_default().push(idx);
@@ -1384,6 +1552,88 @@ impl MemoizedSolverInner {
         }
 
         worst
+    }
+
+    /// Recursively warm the cache for all reachable positions.
+    ///
+    /// For each unguessed letter, partitions the words and ensures each
+    /// partition has an EXACT entry. Recurses into partitions so that
+    /// the referee can respond optimally to any sequence of user guesses.
+    ///
+    /// Uses `visited` to avoid re-traversing positions reached via
+    /// different transposition paths (same canonical key).
+    fn warm_recursive(
+        &self,
+        indices: &[usize],
+        masked: LetterSet,
+        solved: &mut usize,
+        visited: &mut rustc_hash::FxHashSet<u128>,
+    ) {
+        if indices.len() <= 1 {
+            return;
+        }
+
+        // Ensure this position itself has an EXACT entry.
+        let (masked, _) = self.analyze_required_letters(indices, masked);
+        let (deduped, cache_key) = dedup_and_hash(&self.data.words, indices, masked);
+        if deduped.len() <= 1 {
+            return;
+        }
+
+        // Skip if we've already fully warmed this canonical position.
+        if !visited.insert(cache_key) {
+            return;
+        }
+
+        let indices = &deduped;
+
+        // Check if we already have an EXACT entry.
+        let need_solve = if let Some(packed) = self.data.cache.get(&cache_key) {
+            let (_, _, bound) = cache_unpack(*packed);
+            bound != BOUND_EXACT
+        } else if let Some(packed) = self.data.disk_cache.as_ref().and_then(|dc| dc.get(cache_key)) {
+            let (_, _, bound) = cache_unpack(packed);
+            if bound == BOUND_EXACT {
+                // Promote to in-memory cache.
+                self.data.cache.insert(cache_key, packed);
+                false
+            } else {
+                true
+            }
+        } else {
+            true
+        };
+
+        if need_solve {
+            self.solve_subset(indices, masked, 0, u32::MAX);
+            *solved += 1;
+        }
+
+        // Now enumerate all 26 letters and recurse into each partition.
+        let present = self.present_letters(indices, masked);
+        for li in 0..26u8 {
+            if masked & (1 << li) != 0 {
+                continue; // Already guessed.
+            }
+            if present & (1 << li) == 0 {
+                continue; // Not present in any word — miss with no split.
+            }
+            let letter = b'a' + li;
+            let new_masked = masked | letter_bit(letter);
+
+            // Partition by pos_mask.
+            let mut partitions: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+            for &idx in indices {
+                let mask = self.pos_mask_for(idx, letter);
+                partitions.entry(mask).or_default().push(idx);
+            }
+
+            for (_, subset) in &partitions {
+                if subset.len() > 1 {
+                    self.warm_recursive(subset, new_masked, solved, visited);
+                }
+            }
+        }
     }
 }
 

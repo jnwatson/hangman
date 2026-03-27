@@ -21,6 +21,18 @@ tempfile = "3.27.0"
 name = "bench"
 path = "src/bin/bench.rs"
 
+[[bin]]
+name = "tree-depth"
+path = "src/bin/tree_depth.rs"
+
+[[bin]]
+name = "warm-bench"
+path = "src/bin/warm_bench.rs"
+
+[[bin]]
+name = "tt-coverage"
+path = "src/bin/tt_coverage.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1

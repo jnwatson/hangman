@@ -53,3 +53,34 @@ cargo fmt -- --check     # Check formatting
 - Document public APIs. Internal comments only where logic is non-obvious.
 - Error handling: use `anyhow` for CLI, typed errors for library code.
 - No `unsafe` unless profiling proves it necessary and it's well-documented.
+
+## Solver Optimization Lessons
+
+These are hard-won lessons from benchmarking. Violating them causes regressions.
+
+### Lower bounds: cutoff only, never alpha-tightening
+Using a lower bound to raise alpha poisons TT entries — values get stored as UPPER_BOUND instead of EXACT, degrading cache effectiveness across the entire search. Any new lower bound or heuristic should only be used for cutoff (`lb >= beta → return`). Never modify alpha based on a bound that isn't from the TT itself.
+
+### ETC is net negative with expensive canonicalization
+Enhanced Transposition Cutoff probes TT for each partition before recursing, but computing canonical keys (`dedup_and_hash`) is O(n·k·log n) and dominates at intermediate nodes. TT hit rate isn't high enough to amortize. Only use ETC when key computation is cheap (e.g., Zobrist hashing).
+
+### Miss-chain lower bound: depth and threshold tuning
+- Full miss-chain (depth 2-3): gate at ≥5000 words only
+- Depth-1 fast path: when `beta <= 1` and `required_splitting == 0`, just check `present_letters != 0` — this is O(n) and resolves null-window scouts instantly (biggest single optimization, ~35% speedup on k=8)
+- Don't extend to depth=2 for beta≤2 at intermediate nodes — O(26²·n) overhead outweighs pruning
+
+### Partition UB pruning
+Skip partitions where `miss_cost + present_letters(partition).count_ones() <= worst`. But don't try to track the letter union during partitioning inline — enlarging the FxHashMap value type makes it slower. Compute `present_letters` separately after the size check.
+
+### SMP helper tuning
+- MTD(f) path (≤25K words): up to 7 helpers — iterative deepening warms TT, helpers benefit
+- Pure Lazy SMP (>25K words): clamp to 2 helpers — DashMap contention from 7+ threads outweighs search diversity
+
+### MTD(f) + SMP hybrid
+For ≤25K words, main thread does MTD(f) iterative deepening while helpers do full-window search. Helpers should always use full-window (alpha=0, beta=MAX) — ID helpers regress performance. For >25K words, pure Lazy SMP (no iterative deepening) wins.
+
+### Cancellation safety
+Cancelled helpers must return beta (pessimistic) and skip cache stores. Returning alpha=0 poisons the TT — cancelled subtrees look "good" and get cached as correct results.
+
+### Always verify with `--naive` oracle
+After any pruning change, run benchmarks with `--naive` on small-to-medium lengths (k=8-15) to verify correctness. Pruning bugs produce plausible numbers that are simply too low.

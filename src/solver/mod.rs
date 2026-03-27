@@ -4,6 +4,7 @@ pub mod disk_cache;
 mod memoized;
 mod naive;
 mod precomputed;
+pub mod serving;
 mod wordset;
 
 pub use dag::DagSolver;

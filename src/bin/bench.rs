@@ -57,6 +57,17 @@ struct Cli {
     /// Directory for disk cache databases
     #[arg(long, default_value = "./tt_cache")]
     cache_dir: PathBuf,
+
+    /// After solving, warm the cache for all reachable game positions
+    #[arg(long)]
+    warm_cache: bool,
+
+    /// Stop solving at this miss depth instead of finding the exact value.
+    /// Useful for k=4-7 where full solve is infeasible. Runs iterative
+    /// deepening from 1..=N, warming the TT progressively. Combined with
+    /// --save-cache, produces a partial TT for runtime serving.
+    #[arg(long)]
+    bounded: Option<u32>,
 }
 
 fn main() -> Result<()> {
@@ -272,10 +283,19 @@ fn run_benchmark(cli: &Cli, dict: &Dictionary, lengths: &[usize]) -> Result<()> 
         }
 
         // Memoized solver — run in a thread so we can report progress.
+        // When --save-cache is set, always open/create the disk cache upfront
+        // so that flush_to_disk can write intermediate entries during the solve.
         let disk = if cli.load_cache || cli.save_cache {
             let map_size = 16 * 1024 * 1024 * 1024; // 16 GB virtual
-            if cli.load_cache {
+            let existing = if cli.load_cache {
                 DiskCache::open_if_exists(&cli.cache_dir, *len, &words, map_size)?
+            } else {
+                None
+            };
+            if let Some(dc) = existing {
+                Some(dc)
+            } else if cli.save_cache {
+                Some(DiskCache::open(&cli.cache_dir, *len, &words, map_size)?)
             } else {
                 None
             }
@@ -291,15 +311,28 @@ fn run_benchmark(cli: &Cli, dict: &Dictionary, lengths: &[usize]) -> Result<()> 
             MemoizedSolver::new()
         });
         let start = Instant::now();
-        let memo_misses = solve_with_progress(&memo, &words);
+        let memo_misses = if let Some(max_misses) = cli.bounded {
+            solve_bounded_with_progress(&memo, &words, max_misses)
+        } else {
+            solve_with_progress(&memo, &words)
+        };
         let memo_elapsed = start.elapsed();
         let memo_cache = memo.cache_size();
 
+        if cli.warm_cache {
+            let warm_start = Instant::now();
+            let new_positions = memo.warm_serving_cache(&words);
+            eprintln!(
+                "  warmed cache: {} new positions in {:.2}s",
+                new_positions,
+                warm_start.elapsed().as_secs_f64()
+            );
+        }
+
         if cli.save_cache {
-            let map_size = 16 * 1024 * 1024 * 1024;
-            let dc = DiskCache::open(&cli.cache_dir, *len, &words, map_size)?;
-            let saved = dc.save(memo.cache())?;
-            eprintln!("  saved {saved} exact entries to disk cache");
+            // Final flush of any remaining exact entries.
+            let saved = memo.flush_to_disk().unwrap_or(Ok(0))?;
+            eprintln!("  saved {saved} entries to disk cache");
         }
 
         if let Some(dm) = dag_misses {
@@ -321,12 +354,24 @@ fn run_benchmark(cli: &Cli, dict: &Dictionary, lengths: &[usize]) -> Result<()> 
 
         let hash_calls = memo.hash_calls();
         let cache_hits = memo.cache_hits();
+
+        // For bounded mode, show ">N" when the solve didn't converge.
+        let misses_str = if let Some(max) = cli.bounded {
+            if memo_misses > max {
+                format!(">{max}")
+            } else {
+                format!("{memo_misses}")
+            }
+        } else {
+            format!("{memo_misses}")
+        };
+
         if cli.dag {
             println!(
                 "{:>6} {:>8} {:>8} {:>12.2?} {:>8} {:>12.2?} {:>8}",
                 len,
                 words.len(),
-                memo_misses,
+                misses_str,
                 dag_elapsed,
                 dag_cache,
                 memo_elapsed,
@@ -337,7 +382,7 @@ fn run_benchmark(cli: &Cli, dict: &Dictionary, lengths: &[usize]) -> Result<()> 
                 "{:>6} {:>8} {:>8} {:>12.2?} {:>8} {:>10} {:>10}",
                 len,
                 words.len(),
-                memo_misses,
+                misses_str,
                 memo_elapsed,
                 memo_cache,
                 hash_calls,
@@ -348,8 +393,15 @@ fn run_benchmark(cli: &Cli, dict: &Dictionary, lengths: &[usize]) -> Result<()> 
     Ok(())
 }
 
+/// Read this process's resident set size in bytes from /proc/self/statm.
+fn rss_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let rss_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(rss_pages * 4096)
+}
+
 /// Run solver on the current thread, with a background reporter printing
-/// progress every few seconds.
+/// progress every few seconds. Periodically flushes EXACT entries to disk.
 fn solve_with_progress(solver: &Arc<MemoizedSolver>, words: &[Vec<u8>]) -> u32 {
     let pair = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
 
@@ -359,6 +411,7 @@ fn solve_with_progress(solver: &Arc<MemoizedSolver>, words: &[Vec<u8>]) -> u32 {
         let pair = Arc::clone(&pair);
         std::thread::spawn(move || {
             let (lock, cvar) = &*pair;
+            let mut ticks_since_flush = 0u32;
             loop {
                 let done = lock.lock().unwrap();
                 let (done, _) = cvar
@@ -368,9 +421,40 @@ fn solve_with_progress(solver: &Arc<MemoizedSolver>, words: &[Vec<u8>]) -> u32 {
                     break;
                 }
                 drop(done);
+
                 if let Some(snap) = solver.progress() {
+                    let rss = rss_bytes().unwrap_or(0);
+                    let rss_gb = rss as f64 / (1024.0 * 1024.0 * 1024.0);
                     let eta = estimate_remaining(&snap);
-                    print_live_progress(&snap, eta);
+                    print_live_progress(&snap, eta, rss_gb);
+                }
+
+                // Check RSS and evict if too high (35 GB).
+                let rss = rss_bytes().unwrap_or(0);
+                const EVICT_THRESHOLD: u64 = 35 * 1024 * 1024 * 1024;
+                if rss > EVICT_THRESHOLD {
+                    if let Some(result) = solver.flush_and_evict() {
+                        match result {
+                            Ok(n) => eprintln!(
+                                "  (RSS {:.1}G > 35G: flushed {n} entries to disk, evicted in-memory cache)",
+                                rss as f64 / (1024.0 * 1024.0 * 1024.0)
+                            ),
+                            Err(e) => eprintln!("  (flush+evict error: {e})"),
+                        }
+                    }
+                    ticks_since_flush = 0;
+                } else {
+                    // Flush to disk every 60s (12 ticks × 5s).
+                    ticks_since_flush += 1;
+                    if ticks_since_flush >= 12 {
+                        ticks_since_flush = 0;
+                        if let Some(result) = solver.flush_to_disk() {
+                            match result {
+                                Ok(n) => eprintln!("  (flushed {n} exact entries to disk)"),
+                                Err(e) => eprintln!("  (flush error: {e})"),
+                            }
+                        }
+                    }
                 }
             }
         })
@@ -379,6 +463,109 @@ fn solve_with_progress(solver: &Arc<MemoizedSolver>, words: &[Vec<u8>]) -> u32 {
     let result = solver.solve(words);
 
     // Signal reporter to stop immediately.
+    let (lock, cvar) = &*pair;
+    *lock.lock().unwrap() = true;
+    cvar.notify_one();
+    let _ = reporter.join();
+    result
+}
+
+/// Run iterative bounded solves from depth 1..=max_misses, with a background
+/// progress reporter. Each iteration warms the TT, so later iterations benefit
+/// from prior cached results. Flushes to disk between iterations.
+fn solve_bounded_with_progress(
+    solver: &Arc<MemoizedSolver>,
+    words: &[Vec<u8>],
+    max_misses: u32,
+) -> u32 {
+    let pair = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+    // Spawn background reporter thread (same as solve_with_progress).
+    let reporter = {
+        let solver = Arc::clone(solver);
+        let pair = Arc::clone(&pair);
+        std::thread::spawn(move || {
+            let (lock, cvar) = &*pair;
+            let mut ticks_since_flush = 0u32;
+            loop {
+                let done = lock.lock().unwrap();
+                let (done, _) = cvar
+                    .wait_timeout(done, std::time::Duration::from_secs(5))
+                    .unwrap();
+                if *done {
+                    break;
+                }
+                drop(done);
+
+                if let Some(snap) = solver.progress() {
+                    let rss = rss_bytes().unwrap_or(0);
+                    let rss_gb = rss as f64 / (1024.0 * 1024.0 * 1024.0);
+                    let eta = estimate_remaining(&snap);
+                    print_live_progress(&snap, eta, rss_gb);
+                }
+
+                // RSS-based eviction (35 GB threshold).
+                let rss = rss_bytes().unwrap_or(0);
+                const EVICT_THRESHOLD: u64 = 35 * 1024 * 1024 * 1024;
+                if rss > EVICT_THRESHOLD {
+                    if let Some(result) = solver.flush_and_evict() {
+                        match result {
+                            Ok(n) => eprintln!(
+                                "  (RSS {:.1}G > 35G: flushed {n} entries to disk, evicted in-memory cache)",
+                                rss as f64 / (1024.0 * 1024.0 * 1024.0)
+                            ),
+                            Err(e) => eprintln!("  (flush+evict error: {e})"),
+                        }
+                    }
+                    ticks_since_flush = 0;
+                } else {
+                    ticks_since_flush += 1;
+                    if ticks_since_flush >= 12 {
+                        ticks_since_flush = 0;
+                        if let Some(result) = solver.flush_to_disk() {
+                            match result {
+                                Ok(n) => eprintln!("  (flushed {n} entries to disk)"),
+                                Err(e) => eprintln!("  (flush error: {e})"),
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    let wall_start = Instant::now();
+    let mut result = 0;
+    for target in 1..=max_misses {
+        let iter_start = Instant::now();
+        result = solver.solve_bounded(words, target);
+        let iter_secs = iter_start.elapsed().as_secs_f64();
+        let cache_sz = solver.cache_size();
+
+        if result <= target {
+            eprintln!(
+                "  bounded depth={target}: SOLVED (value={result}), cache={cache_sz}, {:.1}s (total {:.1}s)",
+                iter_secs,
+                wall_start.elapsed().as_secs_f64()
+            );
+            break;
+        }
+        eprintln!(
+            "  bounded depth={target}: value>{target}, cache={cache_sz}, {:.1}s (total {:.1}s)",
+            iter_secs,
+            wall_start.elapsed().as_secs_f64()
+        );
+
+        // Flush to disk between iterations.
+        if let Some(flush_result) = solver.flush_to_disk() {
+            match flush_result {
+                Ok(n) => eprintln!("  (inter-iteration flush: {n} entries to disk)"),
+                Err(e) => eprintln!("  (flush error: {e})"),
+            }
+        }
+    }
+
+    // Signal reporter to stop.
     let (lock, cvar) = &*pair;
     *lock.lock().unwrap() = true;
     cvar.notify_one();
@@ -447,7 +634,7 @@ fn estimate_from_iterations(snap: &ProgressSnapshot) -> Option<f64> {
     Some(current_remaining)
 }
 
-fn print_live_progress(snap: &ProgressSnapshot, ema: Option<f64>) {
+fn print_live_progress(snap: &ProgressSnapshot, ema: Option<f64>, rss_gb: f64) {
     if snap.frames.is_empty() {
         return;
     }
@@ -475,5 +662,8 @@ fn print_live_progress(snap: &ProgressSnapshot, ema: Option<f64>) {
         .map(|r| format!("  ETA: {}", format_duration(r)))
         .unwrap_or_default();
 
-    eprintln!("  [{elapsed}]{iter_str} {}{eta}", parts.join(" "));
+    eprintln!(
+        "  [{elapsed}]{iter_str} {} RSS:{rss_gb:.1}G{eta}",
+        parts.join(" ")
+    );
 }

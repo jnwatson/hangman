@@ -79,6 +79,65 @@ pub(super) fn dedup_and_hash(
     dedup_and_hash_general(words, indices, masked, k)
 }
 
+/// Dedup only: collapse identical effective signatures without computing
+/// the canonical hash. Used when the canonical key is already known from
+/// the key_cache but the TT missed.
+pub(super) fn dedup_only(
+    words: &[Vec<u8>],
+    indices: &[usize],
+    masked: u32,
+) -> Vec<usize> {
+    if indices.is_empty() {
+        return vec![];
+    }
+    let k = words[indices[0]].len();
+    if k == 0 {
+        return indices.to_vec();
+    }
+
+    if k <= 8 {
+        return dedup_only_small_k(words, indices, masked, k);
+    }
+
+    // For k > 8, fall back to the full function and discard the hash.
+    dedup_and_hash(words, indices, masked).0
+}
+
+/// Fast dedup for k ≤ 8: encode each sig as u64, sort, and dedup.
+/// Skips the expensive canonicalization step (relabel + column permutation).
+fn dedup_only_small_k(
+    words: &[Vec<u8>],
+    indices: &[usize],
+    masked: u32,
+    k: usize,
+) -> Vec<usize> {
+    use crate::game::letter_bit;
+
+    let n = indices.len();
+    let mut pairs: Vec<(u64, usize)> = Vec::with_capacity(n);
+    for &idx in indices {
+        let word = &words[idx];
+        let mut key = 0u64;
+        for &b in word.iter().take(k) {
+            let eff = if masked & letter_bit(b) != 0 { 0 } else { b };
+            key = key << 8 | u64::from(eff);
+        }
+        pairs.push((key, idx));
+    }
+
+    pairs.sort_unstable();
+
+    let mut deduped: Vec<usize> = Vec::new();
+    let mut prev_key = u64::MAX;
+    for &(key, idx) in &pairs {
+        if key != prev_key {
+            prev_key = key;
+            deduped.push(idx);
+        }
+    }
+    deduped
+}
+
 /// Specialized path for k ≤ 8: encode each sig as a u64.
 fn dedup_and_hash_small_k(
     words: &[Vec<u8>],

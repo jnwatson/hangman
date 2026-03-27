@@ -6,10 +6,6 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use saferlmdb as lmdb;
 
-use super::memoized::cache_unpack;
-
-const BOUND_EXACT: u32 = 0;
-
 /// On-disk transposition table backed by LMDB.
 ///
 /// Stores `(u128 canonical_key → u32 packed_value)` entries in a memory-mapped
@@ -88,7 +84,11 @@ impl DiskCache {
         Self::open(dir, word_length, words, map_size).map(Some)
     }
 
-    /// Write all EXACT entries from an in-memory cache to LMDB.
+    /// Write all entries (EXACT, LOWER, UPPER) from an in-memory cache to LMDB.
+    ///
+    /// When an entry already exists on disk, the new value wins if it is:
+    /// - EXACT (always overwrites), or
+    /// - a tighter bound of the same type.
     ///
     /// Returns the number of entries written.
     ///
@@ -100,10 +100,6 @@ impl DiskCache {
         let mut count = 0usize;
         let entries: Vec<(u128, u32)> = cache
             .iter()
-            .filter(|entry| {
-                let (_, _, bound) = cache_unpack(*entry.value());
-                bound == BOUND_EXACT
-            })
             .map(|entry| (*entry.key(), *entry.value()))
             .collect();
 
@@ -196,13 +192,13 @@ mod tests {
 
         let dc = DiskCache::open(dir.path(), 3, &words, 10 * 1024 * 1024).unwrap();
         let saved = dc.save(&cache).unwrap();
-        assert_eq!(saved, 2);
+        assert_eq!(saved, 3); // All entries including bounds
 
         assert_eq!(dc.get(42), Some(0x0000_0005));
         assert_eq!(dc.get(99), Some(0x0000_0003));
-        assert_eq!(dc.get(200), None);
+        assert_eq!(dc.get(200), Some(0x0000_0005 | (1 << 10))); // LOWER bound
         assert_eq!(dc.get(12345), None);
-        assert_eq!(dc.entry_count(), 2);
+        assert_eq!(dc.entry_count(), 3);
     }
 
     #[test]
