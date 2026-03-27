@@ -1,0 +1,68 @@
+@import url('https://fonts.googleapis.com/css2?family=Creepster&family=Crimson+Text:ital,wght@0,400;0,600;1,400&display=swap');
+
+:root {
+	--bg-dark: #0a0a0f;
+	--bg-card: #13131f;
+	--bg-panel: #1a1a2e;
+	--purple-deep: #2d1b4e;
+	--purple-mid: #6b3fa0;
+	--purple-glow: #9b6dd7;
+	--bone: #e8dcc8;
+	--bone-dim: #8a7f6f;
+	--blood: #8b2233;
+	--blood-bright: #c0392b;
+	--gallows-wood: #5c3d2e;
+	--rope: #c4a777;
+	--text-primary: #e8dcc8;
+	--text-dim: #6b6575;
+	--text-ghost: #3d3647;
+	--accent-blue: #4a7fb5;
+	--accent-blue-glow: #5b9fd4;
+	--success: #4a8b5c;
+
+	--font-display: 'Creepster', cursive;
+	--font-body: 'Crimson Text', Georgia, serif;
+	--font-mono: 'Courier New', monospace;
+}
+
+* {
+	margin: 0;
+	padding: 0;
+	box-sizing: border-box;
+}
+
+html, body {
+	height: 100%;
+	background: var(--bg-dark);
+	color: var(--text-primary);
+	font-family: var(--font-body);
+	font-size: 18px;
+	line-height: 1.5;
+	overflow-x: hidden;
+}
+
+::selection {
+	background: var(--purple-mid);
+	color: var(--bone);
+}
+
+a {
+	color: var(--purple-glow);
+	text-decoration: none;
+}
+
+a:hover {
+	color: var(--accent-blue-glow);
+}
+
+button {
+	font-family: var(--font-body);
+	cursor: pointer;
+	border: none;
+	outline: none;
+}
+
+button:focus-visible {
+	outline: 2px solid var(--purple-glow);
+	outline-offset: 2px;
+}
