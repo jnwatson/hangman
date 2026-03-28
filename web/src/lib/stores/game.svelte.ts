@@ -115,7 +115,7 @@ export function createGameState() {
 		error = null;
 
 		if (MOCK) {
-			state.guessedLetters.add(letter);
+			state.guessedLetters = new Set([...state.guessedLetters, letter]);
 			const positions: number[] = [];
 			for (let i = 0; i < _mockWord.length; i++) {
 				if (_mockWord[i] === letter) positions.push(i);
@@ -156,7 +156,7 @@ export function createGameState() {
 			if (!res.ok) throw new Error(await res.text());
 			const data = await res.json();
 
-			state.guessedLetters.add(letter);
+			state.guessedLetters = new Set([...state.guessedLetters, letter]);
 
 			if (data.positions && data.positions.length > 0) {
 				for (const pos of data.positions) {

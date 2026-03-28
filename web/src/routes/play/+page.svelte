@@ -79,7 +79,13 @@
 				</div>
 			{/if}
 
-			{#if game.state.solveStatus === 'degraded'}
+			{#if game.loading}
+				<div class="thinking">
+					<span class="thinking-dot"></span>
+					<span class="thinking-dot"></span>
+					<span class="thinking-dot"></span>
+				</div>
+			{:else if game.state.solveStatus === 'degraded'}
 				<div class="solve-status degraded">Degraded — some positions uncached</div>
 			{:else if game.state.solveStatus === 'unresolved'}
 				<div class="solve-status unresolved">Unresolved — referee is guessing</div>
@@ -245,6 +251,35 @@
 		color: #e85838;
 		background: rgba(232, 88, 56, 0.1);
 		border: 1px solid rgba(232, 88, 56, 0.3);
+	}
+
+	.thinking {
+		display: flex;
+		gap: 0.4rem;
+		align-items: center;
+		justify-content: center;
+		height: 1.5rem;
+	}
+
+	.thinking-dot {
+		width: 0.5rem;
+		height: 0.5rem;
+		border-radius: 50%;
+		background: var(--purple-mid, #6b3fa0);
+		animation: thinking-pulse 1.2s ease-in-out infinite;
+	}
+
+	.thinking-dot:nth-child(2) {
+		animation-delay: 0.2s;
+	}
+
+	.thinking-dot:nth-child(3) {
+		animation-delay: 0.4s;
+	}
+
+	@keyframes thinking-pulse {
+		0%, 80%, 100% { opacity: 0.2; transform: scale(0.8); }
+		40% { opacity: 1; transform: scale(1.2); }
 	}
 
 	.error-msg {

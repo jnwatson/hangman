@@ -49,7 +49,7 @@ struct LengthData {
     disk_cache: Option<Arc<DiskCache>>,
     minimax_value: Option<u32>,
     /// Solver initialized for on-demand position evaluation.
-    solver: MemoizedSolver,
+    solver: Arc<MemoizedSolver>,
 }
 
 /// Active game session.
@@ -240,27 +240,47 @@ async fn handle_guess(
     }
 
     // Phase 2: Solve cache misses with a 10-second budget.
+    // Run in spawn_blocking to avoid blocking the tokio runtime.
     let mut any_timeout = false;
     if !unsolved.is_empty() {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        for &i in &unsolved {
-            if std::time::Instant::now() >= deadline {
-                any_timeout = true;
-                for &j in &unsolved {
-                    if values[j].is_none() {
-                        tracing::error!(
-                            "SOLVE TIMEOUT: partition of {} words (k={}, masked={:#x})",
-                            parts[j].1.len(),
-                            session.word_length,
-                            new_masked,
-                        );
+        let solver = Arc::clone(&length_data.solver);
+        let unsolved_parts: Vec<(usize, Vec<usize>)> = unsolved
+            .iter()
+            .map(|&i| (i, parts[i].1.clone()))
+            .collect();
+        let word_length = session.word_length;
+
+        let results = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut solved: Vec<(usize, Option<u32>)> = Vec::new();
+            let mut timed_out = false;
+            for (i, indices) in &unsolved_parts {
+                if std::time::Instant::now() >= deadline {
+                    timed_out = true;
+                    for (j, inds) in &unsolved_parts {
+                        if solved.iter().all(|(si, _)| si != j) {
+                            tracing::error!(
+                                "SOLVE TIMEOUT: partition of {} words (k={}, masked={:#x})",
+                                inds.len(),
+                                word_length,
+                                new_masked,
+                            );
+                        }
                     }
+                    break;
                 }
-                break;
+                let value = solver.solve_position(indices, new_masked);
+                solved.push((*i, Some(value)));
             }
-            let value = length_data.solver.solve_position(&parts[i].1, new_masked);
-            values[i] = Some(value);
+            (solved, timed_out)
+        })
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("solve failed: {e}")))?;
+
+        for (i, v) in results.0 {
+            values[i] = v;
         }
+        any_timeout = results.1;
     }
 
     // Phase 3: Pick worst partition.
@@ -421,7 +441,7 @@ async fn main() -> Result<()> {
             v
         }).or_else(|| Some(estimate_minimax(k, words.len())));
 
-        let solver = MemoizedSolver::for_serving(words.clone(), disk_cache.clone());
+        let solver = Arc::new(MemoizedSolver::for_serving(words.clone(), disk_cache.clone()));
 
         lengths.insert(k, LengthData {
             words,
