@@ -15,6 +15,7 @@
 	);
 
 	let gamesPlayed = $state(0);
+	let toolsOpen = $state(false);
 
 	let wrongCount = $derived(game.state?.wrongLetters.length ?? 0);
 	let totalGuessed = $derived(game.state?.guessedLetters.size ?? 0);
@@ -46,22 +47,51 @@
 </script>
 
 {#if game.state}
+	<!-- Tools drawer -->
+	<aside class="tools-drawer" class:open={toolsOpen}>
+		<button class="tools-close" onclick={() => toolsOpen = false}>&times;</button>
+
+		<div class="tool-section">
+			<h3 class="tool-title">Best Move</h3>
+			{#if game.state.gameOver}
+				<span class="tool-dim">Game over</span>
+			{:else if game.hintLoading}
+				<div class="hint-loading">
+					<span class="thinking-dot"></span>
+					<span class="thinking-dot"></span>
+					<span class="thinking-dot"></span>
+				</div>
+			{:else if game.hint}
+				<div class="hint-result">
+					<span class="hint-letter">{game.hint.letter}</span>
+					{#if game.hint.value != null}
+						<span class="hint-value">worst case: {game.hint.value} more misses</span>
+					{/if}
+				</div>
+			{:else}
+				<button class="hint-btn" onclick={() => game.fetchHint()}>Reveal</button>
+			{/if}
+		</div>
+
+		<WordList
+			words={wordList}
+			validWordsBitvec={game.state.validWordsBitvec}
+			showCheat={gamesPlayed >= 1}
+		/>
+	</aside>
+	{#if toolsOpen}
+		<button class="tools-backdrop" onclick={() => toolsOpen = false}></button>
+	{/if}
+
 	<!-- GAME BOARD -->
 	<div class="game-layout">
-		<!-- Left: Word List -->
-		<aside class="panel-left">
-			<WordList
-				words={wordList}
-				validWordsBitvec={game.state.validWordsBitvec}
-				showCheat={gamesPlayed >= 1}
-			/>
-		</aside>
-
 		<!-- Center: Game Area -->
 		<main class="game-center">
 			<div class="game-header">
-				<a href="/" class="back-link">&larr;</a>
-				<span class="word-length-label">{game.state.wordLength} letters</span>
+				<button class="hints-toggle" onclick={() => toolsOpen = !toolsOpen}>Hints</button>
+				<h1 class="game-title">
+					<span class="title-dead">Dead</span> <span class="title-letters">Letters</span>
+				</h1>
 				<div class="guesses-left" class:danger={game.state.guessesLeft <= 2}>
 					<span class="guesses-label">Guesses left</span>
 					<span class="guesses-number">{game.state.guessesLeft}</span>
@@ -69,6 +99,8 @@
 			</div>
 
 			<WordDisplay pattern={game.state.pattern} />
+
+			<span class="word-length-label">{game.state.wordLength} letters</span>
 
 			{#if game.state.wrongLetters.length > 0}
 				<div class="wrong-letters">
@@ -124,32 +156,142 @@
 {/if}
 
 <style>
-	.back-link {
-		font-family: var(--font-body);
+	.hints-toggle {
+		font-family: var(--font-display, 'Creepster', cursive);
 		font-size: 1rem;
-		color: var(--text-dim);
-		text-decoration: none;
+		letter-spacing: 0.05em;
+		color: var(--text-dim, #6b6575);
+		background: none;
+		border: none;
+		cursor: pointer;
+		padding: 0.2rem 0;
 		transition: color 0.2s;
+		flex: 1;
+		text-align: left;
 	}
 
-	.back-link:hover {
-		color: var(--purple-glow);
+	.hints-toggle:hover {
+		color: var(--purple-glow, #9b6dd7);
+	}
+
+	/* ---- TOOLS DRAWER ---- */
+	.tools-drawer {
+		position: fixed;
+		top: 0;
+		left: 0;
+		bottom: 0;
+		width: 260px;
+		background: var(--bg-dark, #0a0a0f);
+		border-right: 1px solid var(--text-ghost, #3d3647);
+		z-index: 50;
+		padding: 0.75rem;
+		padding-top: 2.5rem;
+		display: flex;
+		flex-direction: column;
+		transform: translateX(-100%);
+		transition: transform 0.25s ease;
+	}
+
+	.tools-drawer.open {
+		transform: translateX(0);
+	}
+
+	.tools-close {
+		position: absolute;
+		top: 0.5rem;
+		right: 0.5rem;
+		background: none;
+		border: none;
+		color: var(--text-dim, #6b6575);
+		font-size: 1.4rem;
+		cursor: pointer;
+		line-height: 1;
+		padding: 0.2rem 0.4rem;
+	}
+
+	.tools-close:hover {
+		color: var(--bone, #e8dcc8);
+	}
+
+	.tool-section {
+		margin-bottom: 0.75rem;
+		padding-bottom: 0.75rem;
+		border-bottom: 1px solid var(--text-ghost, #3d3647);
+	}
+
+	.tool-title {
+		font-family: var(--font-display, 'Creepster', cursive);
+		font-size: 1.1rem;
+		font-weight: 400;
+		color: var(--bone-dim, #8a7f6f);
+		letter-spacing: 0.05em;
+		margin-bottom: 0.5rem;
+	}
+
+	.tool-dim {
+		font-size: 0.85rem;
+		color: var(--text-ghost, #3d3647);
+		font-style: italic;
+	}
+
+	.hint-btn {
+		font-family: var(--font-mono, 'Courier New', monospace);
+		font-size: 0.85rem;
+		color: var(--purple-glow, #9b6dd7);
+		background: var(--bg-panel, #1a1a2e);
+		border: 1px solid var(--purple-mid, #6b3fa0);
+		border-radius: 4px;
+		padding: 0.35rem 0.8rem;
+		cursor: pointer;
+		transition: all 0.15s ease;
+	}
+
+	.hint-btn:hover {
+		background: var(--purple-deep, #2d1b4e);
+	}
+
+	.hint-loading {
+		display: flex;
+		gap: 0.3rem;
+		padding: 0.35rem 0;
+	}
+
+	.hint-result {
+		display: flex;
+		align-items: baseline;
+		gap: 0.6rem;
+	}
+
+	.hint-letter {
+		font-family: var(--font-mono, 'Courier New', monospace);
+		font-size: 1.8rem;
+		font-weight: bold;
+		color: var(--purple-glow, #9b6dd7);
+	}
+
+	.hint-value {
+		font-size: 0.8rem;
+		color: var(--text-dim, #6b6575);
+		font-style: italic;
+	}
+
+	.tools-backdrop {
+		position: fixed;
+		inset: 0;
+		z-index: 40;
+		background: rgba(0, 0, 0, 0.4);
+		border: none;
+		cursor: default;
 	}
 
 	/* ---- GAME LAYOUT ---- */
 	.game-layout {
 		display: grid;
-		grid-template-columns: 220px 1fr 260px;
+		grid-template-columns: 1fr 260px;
 		height: 100vh;
 		gap: 1rem;
 		padding: 1rem;
 		overflow: hidden;
-	}
-
-	.panel-left {
-		min-height: 0;
-		overflow: hidden;
-		display: flex;
 	}
 
 	.panel-right {
@@ -180,8 +322,26 @@
 	.guesses-left {
 		display: flex;
 		flex-direction: column;
-		align-items: center;
+		align-items: flex-end;
 		gap: 0.1rem;
+		flex: 1;
+	}
+
+	.game-title {
+		font-family: var(--font-display, 'Creepster', cursive);
+		font-weight: 400;
+		font-size: 1.6rem;
+		letter-spacing: 0.05em;
+		line-height: 1;
+		margin: 0;
+	}
+
+	.game-title .title-dead {
+		color: var(--blood, #8b2233);
+	}
+
+	.game-title .title-letters {
+		color: var(--bone, #e8dcc8);
 	}
 
 	.word-length-label {
@@ -303,10 +463,6 @@
 		.game-layout {
 			grid-template-columns: 1fr;
 			grid-template-rows: auto 1fr auto;
-		}
-
-		.panel-left {
-			display: none; /* collapse word list on mobile */
 		}
 
 		.panel-right {

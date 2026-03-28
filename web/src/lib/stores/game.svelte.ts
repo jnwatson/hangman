@@ -56,8 +56,10 @@ export function createGameState() {
 	let _started = $state(false);
 
 	async function newGame(wordLength: number) {
+		cancelHint();
 		loading = true;
 		error = null;
+		hint = null;
 		_started = true;
 
 		if (MOCK) {
@@ -111,8 +113,10 @@ export function createGameState() {
 	async function guess(letter: string) {
 		if (!state || state.gameOver || state.guessedLetters.has(letter)) return;
 
+		cancelHint();
 		loading = true;
 		error = null;
+		hint = null;
 
 		if (MOCK) {
 			state.guessedLetters = new Set([...state.guessedLetters, letter]);
@@ -192,12 +196,49 @@ export function createGameState() {
 		}
 	}
 
+	let hint = $state<{ letter: string; value: number | null } | null>(null);
+	let hintLoading = $state(false);
+	let hintAbort: AbortController | null = null;
+
+	function cancelHint() {
+		if (hintAbort) {
+			hintAbort.abort();
+			hintAbort = null;
+			hintLoading = false;
+		}
+	}
+
+	async function fetchHint() {
+		if (!state || state.gameOver) return;
+		cancelHint();
+		hintLoading = true;
+		hint = null;
+		hintAbort = new AbortController();
+		try {
+			const res = await fetch(`${API_BASE}/hint?game_id=${state.gameId}`, {
+				signal: hintAbort.signal,
+			});
+			if (!res.ok) throw new Error(await res.text());
+			const data = await res.json();
+			hint = { letter: data.letter, value: data.value ?? null };
+		} catch (e) {
+			if (e instanceof DOMException && e.name === 'AbortError') return;
+			hint = null;
+		} finally {
+			hintAbort = null;
+			hintLoading = false;
+		}
+	}
+
 	return {
 		get state() { return state; },
 		get loading() { return loading; },
 		get error() { return error; },
 		get started() { return _started; },
+		get hint() { return hint; },
+		get hintLoading() { return hintLoading; },
 		newGame,
 		guess,
+		fetchHint,
 	};
 }

@@ -1,3 +1,15 @@
 /target
+/server/target
 /dag_cache
+/game_cache
+/env
+/notes
+/old
+/docs
 *.txt
+*.wav
+watcher.sh
+web/build
+web/node_modules
+web/.svelte-kit
+web/.vscode

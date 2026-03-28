@@ -108,6 +108,20 @@ struct GuessResponse {
 }
 
 #[derive(Deserialize)]
+struct HintQuery {
+    game_id: String,
+}
+
+#[derive(Serialize)]
+struct HintResponse {
+    letter: String,
+    /// Minimax value if this letter is guessed (from the referee's perspective).
+    value: Option<u32>,
+    /// "solved" or "degraded"
+    solve_status: &'static str,
+}
+
+#[derive(Deserialize)]
 struct WordListQuery {
     length: usize,
 }
@@ -371,6 +385,140 @@ async fn handle_guess(
     }))
 }
 
+async fn handle_hint(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HintQuery>,
+) -> Result<Json<HintResponse>, AppError> {
+    let session = state
+        .sessions
+        .get(&params.game_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "game not found"))?;
+
+    if session.game_over {
+        return Err(err(StatusCode::BAD_REQUEST, "game is over"));
+    }
+
+    let length_data = state
+        .lengths
+        .get(&session.word_length)
+        .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "length data missing"))?;
+
+    let masked = session.masked;
+    let remaining = session.remaining.clone();
+    let solver = Arc::clone(&length_data.solver);
+    let words = &length_data.words;
+    let disk_cache = length_data.disk_cache.clone();
+
+    // Evaluate each unguessed letter: compute the referee's best response value.
+    struct LetterEval {
+        letter: u8,
+        value: Option<u32>,
+    }
+
+    let mut evals: Vec<LetterEval> = Vec::new();
+    let mut needs_solve: Vec<(u8, Vec<(u32, Vec<usize>)>)> = Vec::new();
+
+    for letter in b'a'..=b'z' {
+        if masked & letter_bit(letter) != 0 {
+            continue;
+        }
+
+        let mut partitions: HashMap<u32, Vec<usize>> = HashMap::new();
+        for &idx in &remaining {
+            let mask = pos_mask(&words[idx], letter);
+            partitions.entry(mask).or_default().push(idx);
+        }
+
+        let new_masked = masked | letter_bit(letter);
+        let mut worst_value: u32 = 0;
+        let mut all_cached = true;
+
+        for (&pmask, indices) in &partitions {
+            if indices.len() <= 1 {
+                let miss_cost = u32::from(pmask == 0);
+                worst_value = worst_value.max(miss_cost);
+                continue;
+            }
+            let miss_cost = u32::from(pmask == 0);
+            let folded = fold_required_letters(words, indices, new_masked);
+            let hash = canonical_hash_for_words(words, indices, folded);
+            let cached = disk_cache
+                .as_ref()
+                .and_then(|dc| dc.get(hash))
+                .and_then(decode_tt_entry)
+                .map(|e| e.value);
+
+            if let Some(v) = cached {
+                worst_value = worst_value.max(miss_cost + v);
+            } else {
+                all_cached = false;
+            }
+        }
+
+        if all_cached {
+            evals.push(LetterEval { letter, value: Some(worst_value) });
+        } else {
+            let parts: Vec<(u32, Vec<usize>)> = partitions.into_iter().collect();
+            needs_solve.push((letter, parts));
+        }
+    }
+
+    // Solve uncached letters with a budget.
+    let mut any_timeout = false;
+    if !needs_solve.is_empty() {
+        let solve_data: Vec<(u8, Vec<(u32, Vec<usize>)>)> = needs_solve;
+        let solver2 = Arc::clone(&solver);
+
+        let results = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut out: Vec<LetterEval> = Vec::new();
+            let mut timed_out = false;
+
+            for (letter, parts) in &solve_data {
+                if std::time::Instant::now() >= deadline {
+                    timed_out = true;
+                    break;
+                }
+                let new_masked = masked | letter_bit(*letter);
+                let mut worst: u32 = 0;
+
+                for (pmask, indices) in parts {
+                    let miss_cost = u32::from(*pmask == 0);
+                    if indices.len() <= 1 {
+                        worst = worst.max(miss_cost);
+                        continue;
+                    }
+                    let value = solver2.solve_position(indices, new_masked);
+                    worst = worst.max(miss_cost + value);
+                }
+
+                out.push(LetterEval { letter: *letter, value: Some(worst) });
+            }
+            (out, timed_out)
+        })
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("solve failed: {e}")))?;
+
+        evals.extend(results.0);
+        any_timeout = results.1;
+    }
+
+    // Pick the letter with the lowest worst-case value (best for guesser).
+    let best = evals
+        .iter()
+        .filter(|e| e.value.is_some())
+        .min_by_key(|e| e.value.unwrap());
+
+    match best {
+        Some(b) => Ok(Json(HintResponse {
+            letter: (b.letter.to_ascii_uppercase() as char).to_string(),
+            value: b.value,
+            solve_status: if any_timeout { "degraded" } else { "solved" },
+        })),
+        None => Err(err(StatusCode::INTERNAL_SERVER_ERROR, "no letters to evaluate")),
+    }
+}
+
 async fn handle_wordlist(
     State(state): State<Arc<AppState>>,
     Query(params): Query<WordListQuery>,
@@ -462,6 +610,7 @@ async fn main() -> Result<()> {
         .route("/api/health", get(handle_health))
         .route("/api/new", get(handle_new_game))
         .route("/api/guess", post(handle_guess))
+        .route("/api/hint", get(handle_hint))
         .route("/api/wordlist", get(handle_wordlist))
         .with_state(state);
 
