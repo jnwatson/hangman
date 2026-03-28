@@ -79,6 +79,12 @@
 				</div>
 			{/if}
 
+			{#if game.state.solveStatus === 'degraded'}
+				<div class="solve-status degraded">Degraded — some positions uncached</div>
+			{:else if game.state.solveStatus === 'unresolved'}
+				<div class="solve-status unresolved">Unresolved — referee is guessing</div>
+			{/if}
+
 			<Keyboard
 				guessedLetters={game.state.guessedLetters}
 				wrongLetters={game.state.wrongLetters}
@@ -220,6 +226,25 @@
 		padding: 0.2rem 0.4rem;
 		background: rgba(139, 34, 51, 0.15);
 		border-radius: 3px;
+	}
+
+	.solve-status {
+		font-size: 0.85rem;
+		font-style: italic;
+		padding: 0.3rem 0.8rem;
+		border-radius: 4px;
+	}
+
+	.solve-status.degraded {
+		color: #e8a838;
+		background: rgba(232, 168, 56, 0.1);
+		border: 1px solid rgba(232, 168, 56, 0.3);
+	}
+
+	.solve-status.unresolved {
+		color: #e85838;
+		background: rgba(232, 88, 56, 0.1);
+		border: 1px solid rgba(232, 88, 56, 0.3);
 	}
 
 	.error-msg {

@@ -84,3 +84,57 @@ Cancelled helpers must return beta (pessimistic) and skip cache stores. Returnin
 
 ### Always verify with `--naive` oracle
 After any pruning change, run benchmarks with `--naive` on small-to-medium lengths (k=8-15) to verify correctness. Pruning bugs produce plausible numbers that are simply too low.
+
+## Serving Infrastructure
+
+### Production server
+- **Droplet:** deadletters.fun (64.225.9.155), user `nic`, service runs as `www`
+- **Deploy:** `bash deploy.sh [--skip-cache]` — builds server + frontend, uploads, restarts systemd service
+- **Cache:** LMDB on 100GB volume at `/mnt/volume_nyc3_01/cache`, service reads via `--cache-dir`
+- **Nginx:** SPA fallback (`try_files $uri $uri/ /index.html`), proxies `/api/` to port 3000
+- **Server binary:** `server/` crate (Axum), uses disk cache for partition evaluation
+- **Frontend:** `web/` (SvelteKit), built as static site with adapter-static for deploy
+
+### Game API design
+- `GuessResponse` includes `solve_status`: `"solved"` (all partitions cached), `"degraded"` (some missed but chosen was cached), `"unresolved"` (chosen partition had cache miss — referee is guessing)
+- Valid words sent as base64-encoded bitvector (`valid_words_bitvec`), not index array
+- Frontend tracks worst `solveStatus` across all guesses in a game
+
+### Partition selection bug (fixed)
+`best_partition_mask` must be initialized from the first actual partition entry, not hardcoded to 0. Initializing to 0 (miss) causes the referee to mark letters as wrong while keeping words that contain them — when all partitions have value 0 (cache miss) and no miss partition exists.
+
+## Precompute Infrastructure
+
+### Precompute binary
+`src/bin/precompute.rs` — enumerates depth-1 and depth-2 game tree positions, solves uncached ones with full SMP solver, flushes to LMDB disk cache.
+
+```bash
+# Solve all positions for k=8, no size limit
+target/release/precompute --dict enable1.txt --lengths 8 --cache-dir game_cache --depth 2 --max-words 999999
+```
+
+- **Resumable:** checks disk cache before each solve via `is_cached_exact()`
+- **Always use `--max-words 999999`** (default 5000 skips large positions, leaving cache gaps that break serving)
+- Sorts positions largest-first, uses full `solve()` for SMP parallelism
+
+### Compute droplets (DigitalOcean)
+Three `c-16` droplets (16 vCPUs, 32GB RAM) in NYC1, tagged `hangman-compute`:
+
+| Host | IP | Assignment |
+|------|-----|------------|
+| hc1 | 143.198.120.95 | k=7 (23K words, minimax=11) |
+| hc2 | 64.227.4.233 | k=8 (28K words, minimax=8) |
+| hc3 | 165.227.83.53 | k=5,6 (8.6K + 15K words) |
+
+- SSH aliases `hc1`, `hc2`, `hc3` configured in `~/.ssh/config`
+- Source code at `/root/hangman2/`, caches at `/root/hangman2/game_cache/`
+- Logs at `/tmp/precompute.log` on each droplet
+- **Notifications:** via `ntfy.sh/hangman2-compute-nic` — subscribe in ntfy app
+- k=3,4 runs locally (small enough)
+
+### Workflow: after precompute completes
+1. Rsync cache from droplet back to local: `rsync -az hcN:/root/hangman2/game_cache/tt_lenK_* game_cache/`
+2. Rsync cache to production: `rsync -az game_cache/tt_lenK_* nic@64.225.9.155:/mnt/volume_nyc3_01/cache/`
+3. Fix permissions: `ssh nic@64.225.9.155 'sudo chown -R www:www /mnt/volume_nyc3_01/cache'`
+4. Restart service: `ssh nic@64.225.9.155 'sudo systemctl restart dead-letters'`
+5. Destroy droplets when done (DO API key in `env` file, never commit)

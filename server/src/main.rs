@@ -100,6 +100,8 @@ struct GuessResponse {
     won: bool,
     example_word: Option<String>,
     valid_words_bitvec: String,
+    /// "solved", "degraded", or "unresolved"
+    solve_status: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -210,11 +212,13 @@ async fn handle_guess(
     let mut best_partition_mask = init_mask;
     let mut best_value = 0u32;
     let mut best_indices: &Vec<usize> = init_indices;
+    let mut best_was_cached = true; // whether the chosen partition had a cache hit
+    let mut any_miss = false;
 
     for (&pmask, indices) in &partitions {
         let miss_cost = u32::from(pmask == 0);
-        let value = if indices.len() <= 1 {
-            miss_cost
+        let (value, cached) = if indices.len() <= 1 {
+            (miss_cost, true)
         } else {
             // Fold required letters to match solver's key computation.
             let folded = fold_required_letters(&length_data.words, indices, new_masked);
@@ -226,7 +230,8 @@ async fn handle_guess(
                 .and_then(decode_tt_entry)
                 .map(|e| e.value);
 
-            miss_cost + cached_value.unwrap_or_else(|| {
+            if cached_value.is_none() {
+                any_miss = true;
                 tracing::error!(
                     "CACHE MISS: partition of {} words (k={}, masked={:#x}, hash={:#x})",
                     indices.len(),
@@ -234,16 +239,28 @@ async fn handle_guess(
                     new_masked,
                     hash,
                 );
-                0
-            })
+            }
+
+            (miss_cost + cached_value.unwrap_or(0), cached_value.is_some())
         };
 
         if value > best_value || (value == best_value && indices.len() > best_indices.len()) {
             best_value = value;
             best_partition_mask = pmask;
             best_indices = indices;
+            best_was_cached = cached;
         }
     }
+
+    // "solved" = all partitions cached, "degraded" = some missed but chosen was cached,
+    // "unresolved" = chosen partition itself had a cache miss.
+    let solve_status = if !any_miss {
+        "solved"
+    } else if best_was_cached {
+        "degraded"
+    } else {
+        "unresolved"
+    };
 
     // Update session state.
     session.masked = new_masked;
@@ -305,6 +322,7 @@ async fn handle_guess(
         won: session.won,
         example_word,
         valid_words_bitvec: encode_bitvec(&session.remaining, length_data.words.len()),
+        solve_status,
     }))
 }
 

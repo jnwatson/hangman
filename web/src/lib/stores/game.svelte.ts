@@ -17,6 +17,8 @@ export interface GameState {
 	minimaxValue: number | null;
 	/** Bitvector of words still valid after the referee's choices (from base64). */
 	validWordsBitvec: Uint8Array | null;
+	/** Worst solve status seen: "solved", "degraded", or "unresolved". */
+	solveStatus: 'solved' | 'degraded' | 'unresolved';
 }
 
 // Simple mock: picks a random word, plays normal (non-adversarial) hangman
@@ -74,6 +76,7 @@ export function createGameState() {
 				exampleWord: null,
 				minimaxValue: MOCK_MINIMAX[wordLength] ?? null,
 				validWordsBitvec: null,
+			solveStatus: 'solved',
 			};
 			loading = false;
 			return;
@@ -96,6 +99,7 @@ export function createGameState() {
 				exampleWord: null,
 				minimaxValue: data.minimax_value ?? null,
 				validWordsBitvec: null,
+			solveStatus: 'solved',
 			};
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'Failed to start game';
@@ -175,6 +179,11 @@ export function createGameState() {
 				state.validWordsBitvec = bv;
 			} else {
 				state.validWordsBitvec = null;
+			}
+			const status = data.solve_status as 'solved' | 'degraded' | 'unresolved';
+			const rank = { solved: 0, degraded: 1, unresolved: 2 };
+			if (rank[status] > rank[state.solveStatus]) {
+				state.solveStatus = status;
 			}
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'Failed to submit guess';

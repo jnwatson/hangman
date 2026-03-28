@@ -46,9 +46,9 @@ struct Cli {
     #[arg(long, default_value = "2")]
     depth: usize,
 
-    /// Skip positions with more than this many words (they're too slow)
-    #[arg(long, default_value = "5000")]
-    max_words: usize,
+    /// Skip positions with more than this many words
+    #[arg(long)]
+    max_words: Option<usize>,
 }
 
 /// Partition word indices by their positional pattern for a given letter.
@@ -84,16 +84,18 @@ fn is_cached_exact(dc: &DiskCache, words: &[Vec<u8>], indices: &[usize], masked:
 
 /// Solve a position using full SMP and flush to disk cache.
 /// Returns (value, elapsed, new_entries).
+///
+/// Uses `solve_position` with the full word list and correct masked value
+/// so that TT entries are keyed identically to the server's lookup path.
 fn solve_and_flush(
     dc: &Arc<DiskCache>,
     words: &[Vec<u8>],
     indices: &[usize],
-    _masked: u32,
+    masked: u32,
 ) -> (u32, std::time::Duration, usize) {
-    let subset: Vec<Vec<u8>> = indices.iter().map(|&i| words[i].clone()).collect();
     let solver = MemoizedSolver::with_disk_cache(Arc::clone(dc));
     let start = Instant::now();
-    let value = solver.solve(&subset);
+    let value = solver.solve_position_smp(words, indices, masked);
     let elapsed = start.elapsed();
     let flushed = solver.flush_to_disk().unwrap_or(Ok(0)).unwrap_or(0);
     (value, elapsed, flushed)
@@ -205,9 +207,11 @@ fn main() -> Result<()> {
 
         let mut too_large = 0usize;
         for (i, pos) in positions.iter().enumerate() {
-            if pos.indices.len() > cli.max_words {
-                too_large += 1;
-                continue;
+            if let Some(max) = cli.max_words {
+                if pos.indices.len() > max {
+                    too_large += 1;
+                    continue;
+                }
             }
             if is_cached_exact(&dc, &words, &pos.indices, pos.masked) {
                 skipped += 1;
@@ -233,8 +237,7 @@ fn main() -> Result<()> {
 
         let wall = wall_start.elapsed();
         println!(
-            "  Done: {solved} solved, {skipped} cached, {too_large} skipped (>{} words), {total_flushed} entries flushed, {wall:.1?} total",
-            cli.max_words
+            "  Done: {solved} solved, {skipped} cached, {too_large} skipped (too large), {total_flushed} entries flushed, {wall:.1?} total",
         );
         println!("  Disk cache now: {} entries\n", dc.entry_count());
     }

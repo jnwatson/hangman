@@ -405,6 +405,129 @@ impl MemoizedSolver {
         result
     }
 
+    /// Solve a specific game position with full SMP parallelism.
+    ///
+    /// Unlike `solve()` which starts from the root (all words, masked=0),
+    /// this starts from an arbitrary position. Unlike `solve_position()` which
+    /// is single-threaded for serving, this uses full SMP for precompute.
+    ///
+    /// `words` must be the full dictionary for this length (not a subset) so
+    /// that TT entries are keyed identically to the server's lookup path.
+    pub fn solve_position_smp(
+        &self,
+        words: &[Vec<u8>],
+        indices: &[usize],
+        masked: LetterSet,
+    ) -> u32 {
+        if indices.is_empty() {
+            return 0;
+        }
+        let data = Arc::new(SolverData::new(words.to_vec(), self.disk_cache.clone()));
+        *self.active_data.lock().unwrap() = Some(Arc::clone(&data));
+        let indices: Vec<usize> = indices.to_vec();
+
+        let n_words = indices.len();
+        let n_extra = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            / 4;
+        let n_extra = if n_words <= 25_000 {
+            n_extra.clamp(1, 7)
+        } else {
+            n_extra.clamp(1, 2)
+        };
+
+        let result = if n_words <= 25_000 {
+            std::thread::scope(|s| {
+                #[allow(clippy::cast_possible_truncation)]
+                let _helpers: Vec<_> = (1..=n_extra as u32)
+                    .map(|tid| {
+                        let data = Arc::clone(&data);
+                        let indices = indices.clone();
+                        s.spawn(move || {
+                            let solver = MemoizedSolverInner::new(data, tid, false);
+                            solver.solve_subset(&indices, masked, 0, u32::MAX)
+                        })
+                    })
+                    .collect();
+
+                let solver = MemoizedSolverInner::new(Arc::clone(&data), 0, true);
+                let mut result = 0;
+                let mut lo = 0u32;
+                for (iter, target) in (0..26u32).enumerate() {
+                    #[allow(clippy::cast_possible_truncation)]
+                    data.mtd_iteration.store(iter as u32, Ordering::Relaxed);
+                    let iter_start = Instant::now();
+                    result = solver.solve_subset(&indices, masked, lo, target + 1);
+                    let iter_secs = iter_start.elapsed().as_secs_f64();
+                    if iter_secs > 0.01 {
+                        data.iter_durations.lock().unwrap().push(iter_secs);
+                    }
+                    if result <= target {
+                        break;
+                    }
+                    lo = result;
+                }
+
+                solver.solve_subset(&indices, masked, 0, result + 1);
+
+                data.cancelled.store(true, Ordering::Relaxed);
+                result
+            })
+        } else {
+            std::thread::scope(|s| {
+                #[allow(clippy::cast_possible_truncation)]
+                let handles: Vec<_> = (1..=n_extra as u32)
+                    .map(|tid| {
+                        let data = Arc::clone(&data);
+                        let indices = indices.clone();
+                        s.spawn(move || {
+                            let solver = MemoizedSolverInner::new(data, tid, false);
+                            solver.solve_subset(&indices, masked, 0, u32::MAX)
+                        })
+                    })
+                    .collect();
+
+                let main_result = {
+                    let solver = MemoizedSolverInner::new(Arc::clone(&data), 0, true);
+                    solver.solve_subset(&indices, masked, 0, u32::MAX)
+                };
+
+                let mut best = main_result;
+                for h in handles {
+                    best = best.min(h.join().unwrap());
+                }
+                best
+            })
+        };
+
+        self.hash_calls
+            .fetch_add(data.hash_calls.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.cache_hits
+            .fetch_add(data.cache_hits.load(Ordering::Relaxed), Ordering::Relaxed);
+        for entry in &data.cache {
+            let key = *entry.key();
+            let new_packed = *entry.value();
+            let (new_val, _, new_bound) = cache_unpack(new_packed);
+            if let Some(existing) = self.cache.get(&key) {
+                let (old_val, _, old_bound) = cache_unpack(*existing);
+                let dominated = new_bound == BOUND_EXACT
+                    || (old_bound != BOUND_EXACT
+                        && ((new_bound == BOUND_LOWER && new_val > old_val)
+                            || (new_bound == BOUND_UPPER && new_val < old_val)));
+                drop(existing);
+                if dominated {
+                    self.cache.insert(key, new_packed);
+                }
+            } else {
+                self.cache.insert(key, new_packed);
+            }
+        }
+
+        *self.active_data.lock().unwrap() = None;
+        result
+    }
+
     /// Solve with a maximum miss budget. Returns the minimax value if it is
     /// `<= max_misses`, otherwise returns the budget value (meaning the true
     /// value is `> max_misses`).
