@@ -108,8 +108,8 @@
 	.key.correct {
 		background: var(--purple-mid, #6b3fa0);
 		border-color: var(--purple-glow, #9b6dd7);
-		color: var(--bone, #e8dcc8);
-		opacity: 0.6;
+		color: #fff;
+		box-shadow: 0 0 6px var(--purple-glow, #9b6dd7);
 	}
 
 	.key:disabled {
