@@ -21,6 +21,7 @@ use hangman2::dictionary::Dictionary;
 use hangman2::game::{letter_bit, LetterSet};
 use hangman2::solver::disk_cache::DiskCache;
 use hangman2::solver::serving::{canonical_hash_for_words, decode_tt_entry, fold_required_letters, pos_mask};
+use hangman2::solver::MemoizedSolver;
 
 #[derive(Parser)]
 #[command(name = "dead-letters-server")]
@@ -45,8 +46,10 @@ struct Cli {
 /// Per-length precomputed data.
 struct LengthData {
     words: Vec<Vec<u8>>,
-    disk_cache: Option<DiskCache>,
+    disk_cache: Option<Arc<DiskCache>>,
     minimax_value: Option<u32>,
+    /// Solver initialized for on-demand position evaluation.
+    solver: MemoizedSolver,
 }
 
 /// Active game session.
@@ -208,58 +211,80 @@ async fn handle_guess(
 
     // Pick the worst partition for the guesser (highest minimax value).
     let new_masked = session.masked | letter_bit(letter);
-    let (&init_mask, init_indices) = partitions.iter().next().unwrap();
-    let mut best_partition_mask = init_mask;
-    let mut best_value = 0u32;
-    let mut best_indices: &Vec<usize> = init_indices;
-    let mut best_was_cached = true; // whether the chosen partition had a cache hit
-    let mut any_miss = false;
 
-    for (&pmask, indices) in &partitions {
-        let miss_cost = u32::from(pmask == 0);
-        let (value, cached) = if indices.len() <= 1 {
-            (miss_cost, true)
-        } else {
-            // Fold required letters to match solver's key computation.
-            let folded = fold_required_letters(&length_data.words, indices, new_masked);
-            let hash = canonical_hash_for_words(&length_data.words, indices, folded);
-            let cached_value = length_data
-                .disk_cache
-                .as_ref()
-                .and_then(|dc| dc.get(hash))
-                .and_then(decode_tt_entry)
-                .map(|e| e.value);
+    // Collect partitions into a stable Vec for indexed access.
+    let parts: Vec<(u32, Vec<usize>)> = partitions.into_iter().collect();
 
-            if cached_value.is_none() {
-                any_miss = true;
-                tracing::error!(
-                    "CACHE MISS: partition of {} words (k={}, masked={:#x}, hash={:#x})",
-                    indices.len(),
-                    session.word_length,
-                    new_masked,
-                    hash,
-                );
-            }
+    // Phase 1: Look up all partitions in the cache, track which need solving.
+    let mut values: Vec<Option<u32>> = Vec::with_capacity(parts.len());
+    let mut unsolved: Vec<usize> = Vec::new();
 
-            (miss_cost + cached_value.unwrap_or(0), cached_value.is_some())
-        };
+    for (i, (_pmask, indices)) in parts.iter().enumerate() {
+        if indices.len() <= 1 {
+            values.push(Some(0));
+            continue;
+        }
+        let folded = fold_required_letters(&length_data.words, indices, new_masked);
+        let hash = canonical_hash_for_words(&length_data.words, indices, folded);
+        let cached = length_data
+            .disk_cache
+            .as_ref()
+            .and_then(|dc| dc.get(hash))
+            .and_then(decode_tt_entry)
+            .map(|e| e.value);
 
-        if value > best_value || (value == best_value && indices.len() > best_indices.len()) {
-            best_value = value;
-            best_partition_mask = pmask;
-            best_indices = indices;
-            best_was_cached = cached;
+        values.push(cached);
+        if cached.is_none() {
+            unsolved.push(i);
         }
     }
 
-    // "solved" = all partitions cached, "degraded" = some missed but chosen was cached,
-    // "unresolved" = chosen partition itself had a cache miss.
-    let solve_status = if !any_miss {
+    // Phase 2: Solve cache misses with a 10-second budget.
+    let mut any_timeout = false;
+    if !unsolved.is_empty() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        for &i in &unsolved {
+            if std::time::Instant::now() >= deadline {
+                any_timeout = true;
+                for &j in &unsolved {
+                    if values[j].is_none() {
+                        tracing::error!(
+                            "SOLVE TIMEOUT: partition of {} words (k={}, masked={:#x})",
+                            parts[j].1.len(),
+                            session.word_length,
+                            new_masked,
+                        );
+                    }
+                }
+                break;
+            }
+            let value = length_data.solver.solve_position(&parts[i].1, new_masked);
+            values[i] = Some(value);
+        }
+    }
+
+    // Phase 3: Pick worst partition.
+    let mut best_idx = 0;
+    let mut best_value = 0u32;
+
+    for (i, (pmask, indices)) in parts.iter().enumerate() {
+        let miss_cost = u32::from(*pmask == 0);
+        let value = miss_cost + values[i].unwrap_or(0);
+        if value > best_value || (value == best_value && indices.len() > parts[best_idx].1.len()) {
+            best_value = value;
+            best_idx = i;
+        }
+    }
+
+    let best_partition_mask = parts[best_idx].0;
+    let best_indices = &parts[best_idx].1;
+
+    let solve_status = if unsolved.is_empty() {
         "solved"
-    } else if best_was_cached {
+    } else if any_timeout {
         "degraded"
     } else {
-        "unresolved"
+        "solved" // all misses resolved within budget
     };
 
     // Update session state.
@@ -366,27 +391,11 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        let disk_cache = if cli.cache_dir.exists() {
+        let disk_cache: Option<Arc<DiskCache>> = if cli.cache_dir.exists() {
             match DiskCache::open_if_exists(&cli.cache_dir, k, &words, 16 * 1024 * 1024 * 1024) {
                 Ok(Some(dc)) => {
                     info!("k={}: loaded disk cache ({} entries)", k, dc.entry_count());
-                    // Look up root position to get minimax value.
-                    let all_indices: Vec<usize> = (0..words.len()).collect();
-                    let root_masked = fold_required_letters(&words, &all_indices, 0);
-                    let root_hash = canonical_hash_for_words(&words, &all_indices, root_masked);
-                    let minimax = dc
-                        .get(root_hash)
-                        .and_then(decode_tt_entry)
-                        .map(|e| e.value);
-                    if let Some(v) = minimax {
-                        info!("k={}: minimax value = {}", k, v);
-                    }
-                    lengths.insert(k, LengthData {
-                        words,
-                        disk_cache: Some(dc),
-                        minimax_value: minimax,
-                    });
-                    continue;
+                    Some(Arc::new(dc))
                 }
                 Ok(None) => {
                     info!("k={}: no disk cache found", k);
@@ -401,12 +410,24 @@ async fn main() -> Result<()> {
             None
         };
 
-        // No precomputed data — use hardcoded estimates.
-        let minimax_estimate = estimate_minimax(k, words.len());
+        let minimax_value = disk_cache.as_ref().and_then(|dc| {
+            let all_indices: Vec<usize> = (0..words.len()).collect();
+            let root_masked = fold_required_letters(&words, &all_indices, 0);
+            let root_hash = canonical_hash_for_words(&words, &all_indices, root_masked);
+            let v = dc.get(root_hash).and_then(decode_tt_entry).map(|e| e.value);
+            if let Some(val) = v {
+                info!("k={}: minimax value = {}", k, val);
+            }
+            v
+        }).or_else(|| Some(estimate_minimax(k, words.len())));
+
+        let solver = MemoizedSolver::for_serving(words.clone(), disk_cache.clone());
+
         lengths.insert(k, LengthData {
             words,
             disk_cache,
-            minimax_value: Some(minimax_estimate),
+            minimax_value,
+            solver,
         });
     }
 

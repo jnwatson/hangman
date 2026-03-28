@@ -501,6 +501,21 @@ impl MemoizedSolver {
             })
         };
 
+        // Force-store EXACT entry for the root position. The MTD(f)
+        // verification pass may fail to produce EXACT because TT bounds
+        // from earlier iterations narrow the window (e.g., UPPER_BOUND
+        // tightens beta so best == beta → LOWER_BOUND stored instead).
+        {
+            let folded = crate::solver::serving::fold_required_letters(
+                &data.words, &indices, masked,
+            );
+            let root_key = crate::solver::serving::canonical_hash_for_words(
+                &data.words, &indices, folded,
+            );
+            let packed = cache_pack(result, 0, BOUND_EXACT);
+            data.cache.insert(root_key, packed);
+        }
+
         self.hash_calls
             .fetch_add(data.hash_calls.load(Ordering::Relaxed), Ordering::Relaxed);
         self.cache_hits
@@ -1898,5 +1913,76 @@ mod tests {
         let a = vec![b"ab".to_vec(), b"ac".to_vec()];
         let b = vec![b"de".to_vec(), b"fg".to_vec()];
         assert_ne!(canonicalize(&a), canonicalize(&b));
+    }
+
+    /// Verify that `solve_position_smp` stores EXACT entries that the server
+    /// can look up via `fold_required_letters` + `canonical_hash_for_words`.
+    ///
+    /// Regression test: MTD(f)'s verification pass had its window narrowed by
+    /// UPPER_BOUND TT entries from earlier iterations, causing the root entry
+    /// to be stored as LOWER_BOUND instead of EXACT. The server's
+    /// `decode_tt_entry` filters non-EXACT entries, causing cache misses.
+    #[test]
+    fn solve_position_smp_stores_exact_entries() {
+        use super::super::serving::{
+            canonical_hash_for_words, decode_tt_entry, fold_required_letters,
+        };
+        use crate::game::letter_bit;
+
+        // Words that produce non-trivial partitions after guessing 'a'.
+        let words: Vec<Vec<u8>> = ["cat", "bat", "hat", "mat", "dog", "fog", "log", "hog"]
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
+        let all_indices: Vec<usize> = (0..words.len()).collect();
+
+        // Partition by letter 'a': miss partition (dog/fog/log/hog) and
+        // hit partition (cat/bat/hat/mat).
+        let masked = letter_bit(b'a');
+        let mut partitions: std::collections::HashMap<u32, Vec<usize>> =
+            std::collections::HashMap::new();
+        for &i in &all_indices {
+            let mut pmask = 0u32;
+            for (j, &b) in words[i].iter().enumerate() {
+                if b == b'a' {
+                    pmask |= 1 << j;
+                }
+            }
+            partitions.entry(pmask).or_default().push(i);
+        }
+
+        let solver = MemoizedSolver::new();
+
+        for (_pmask, indices) in &partitions {
+            if indices.len() <= 1 {
+                continue;
+            }
+            solver.solve_position_smp(&words, indices, masked);
+        }
+
+        // Verify: every non-trivial partition has an EXACT entry in the
+        // solver's cache, retrievable via the server's lookup path.
+        for (_pmask, indices) in &partitions {
+            if indices.len() <= 1 {
+                continue;
+            }
+            let folded = fold_required_letters(&words, indices, masked);
+            let hash = canonical_hash_for_words(&words, indices, folded);
+
+            let packed = solver
+                .cache
+                .get(&hash)
+                .map(|v| *v)
+                .expect("root entry should be in cache");
+            let entry = decode_tt_entry(packed);
+            assert!(
+                entry.is_some(),
+                "root entry for partition of {} words should be EXACT, \
+                 got packed={:#x} (bound={})",
+                indices.len(),
+                packed,
+                cache_unpack(packed).2,
+            );
+        }
     }
 }
