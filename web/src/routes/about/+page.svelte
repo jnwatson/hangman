@@ -77,7 +77,7 @@
 	<section class="about-section">
 		<h2>Dictionary</h2>
 		<p>
-			Dead Letters uses the <strong>enable1</strong> word list (172,820 words), a
+			Dead Letters uses the <a href="https://norvig.com/ngrams/enable1.txt" class="inline-link">enable1</a> word list (172,820 words), a
 			standard competitive Scrabble dictionary. The full word list is available in
 			the hints panel during play.
 		</p>
@@ -235,6 +235,17 @@
 	.table-note {
 		font-size: 0.85rem !important;
 		font-style: italic;
+	}
+
+	.inline-link {
+		color: var(--purple-glow, #9b6dd7);
+		text-decoration: none;
+		font-weight: bold;
+		transition: color 0.2s;
+	}
+
+	.inline-link:hover {
+		color: var(--bone, #e8dcc8);
 	}
 
 	.github-link {
