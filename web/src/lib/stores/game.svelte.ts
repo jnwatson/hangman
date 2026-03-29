@@ -60,6 +60,7 @@ export function createGameState() {
 		loading = true;
 		error = null;
 		hint = null;
+		hintFailed = false;
 		_started = true;
 
 		if (MOCK) {
@@ -117,6 +118,7 @@ export function createGameState() {
 		loading = true;
 		error = null;
 		hint = null;
+		hintFailed = false;
 
 		if (MOCK) {
 			state.guessedLetters = new Set([...state.guessedLetters, letter]);
@@ -198,6 +200,7 @@ export function createGameState() {
 
 	let hint = $state<{ letter: string; value: number | null } | null>(null);
 	let hintLoading = $state(false);
+	let hintFailed = $state(false);
 	let hintAbort: AbortController | null = null;
 
 	function cancelHint() {
@@ -212,6 +215,7 @@ export function createGameState() {
 		if (!state || state.gameOver) return;
 		cancelHint();
 		hintLoading = true;
+		hintFailed = false;
 		hint = null;
 		hintAbort = new AbortController();
 		try {
@@ -220,10 +224,15 @@ export function createGameState() {
 			});
 			if (!res.ok) throw new Error(await res.text());
 			const data = await res.json();
-			hint = { letter: data.letter, value: data.value ?? null };
+			if (data.letter) {
+				hint = { letter: data.letter, value: data.value ?? null };
+				if (data.solve_status === 'degraded') hintFailed = true;
+			} else {
+				hintFailed = true;
+			}
 		} catch (e) {
 			if (e instanceof DOMException && e.name === 'AbortError') return;
-			hint = null;
+			hintFailed = true;
 		} finally {
 			hintAbort = null;
 			hintLoading = false;
@@ -237,6 +246,7 @@ export function createGameState() {
 		get started() { return _started; },
 		get hint() { return hint; },
 		get hintLoading() { return hintLoading; },
+		get hintFailed() { return hintFailed; },
 		newGame,
 		guess,
 		fetchHint,

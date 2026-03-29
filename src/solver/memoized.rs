@@ -222,6 +222,18 @@ impl MemoizedSolver {
     /// Panics if the solver was not initialized via `for_serving`.
     #[must_use]
     pub fn solve_position(&self, indices: &[usize], masked: LetterSet) -> u32 {
+        self.solve_position_with_deadline(indices, masked, None)
+    }
+
+    /// Solve with an optional deadline. Returns the result if completed in time,
+    /// or `None` if the deadline was hit (result is unreliable).
+    #[must_use]
+    pub fn solve_position_with_deadline(
+        &self,
+        indices: &[usize],
+        masked: LetterSet,
+        deadline: Option<std::time::Instant>,
+    ) -> u32 {
         if indices.len() <= 1 {
             return 0;
         }
@@ -230,8 +242,28 @@ impl MemoizedSolver {
         drop(guard);
 
         data.cancelled.store(false, Ordering::Relaxed);
+
+        // If a deadline is set, spawn a watchdog thread that cancels the solve.
+        let _watchdog = deadline.map(|dl| {
+            let cancelled = Arc::clone(&data);
+            std::thread::spawn(move || {
+                let now = std::time::Instant::now();
+                if let Some(remaining) = dl.checked_duration_since(now) {
+                    std::thread::sleep(remaining);
+                }
+                cancelled.cancelled.store(true, Ordering::Relaxed);
+            })
+        });
+
         let inner = MemoizedSolverInner::new(data, 0, false);
         inner.solve_subset(indices, masked, 0, u32::MAX)
+    }
+
+    /// Check if the last solve was cancelled (hit deadline).
+    #[must_use]
+    pub fn was_cancelled(&self) -> bool {
+        let guard = self.active_data.lock().unwrap();
+        guard.as_ref().map_or(false, |d| d.cancelled.load(Ordering::Relaxed))
     }
 
     /// Warm the cache for serving: ensure every reachable position has an

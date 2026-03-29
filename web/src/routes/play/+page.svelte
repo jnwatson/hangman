@@ -6,6 +6,7 @@
 	import DeathScreen from '$lib/components/DeathScreen.svelte';
 	import { createGameState } from '$lib/stores/game.svelte';
 	import { loadDictionary, wordsByLength } from '$lib/dictionary';
+	import { page } from '$app/state';
 
 	const game = createGameState();
 
@@ -22,7 +23,12 @@
 	let maxWrong = $derived((game.state?.guessesAllowed ?? 6) + 1);
 	let hangmanStage = $derived(Math.min(Math.round(wrongCount * 7 / maxWrong), 7));
 
-	function randomLength(): number {
+	function getLength(): number {
+		const n = page.url.searchParams.get('n');
+		if (n) {
+			const parsed = parseInt(n, 10);
+			if (parsed >= 2 && parsed <= 28) return parsed;
+		}
 		return Math.floor(Math.random() * 12) + 3; // 3–14
 	}
 
@@ -32,7 +38,7 @@
 			loadDictionary().then(words => {
 				allWords = words;
 			});
-			game.newGame(randomLength());
+			game.newGame(getLength());
 		}
 	});
 
@@ -42,7 +48,7 @@
 
 	function playAgain() {
 		gamesPlayed++;
-		game.newGame(randomLength());
+		game.newGame(getLength());
 	}
 </script>
 
@@ -68,6 +74,11 @@
 						<span class="hint-value">worst case: {game.hint.value} more misses</span>
 					{/if}
 				</div>
+				{#if game.hintFailed}
+					<span class="hint-caveat">approximate — some positions too complex</span>
+				{/if}
+			{:else if game.hintFailed}
+				<span class="tool-dim">Position too complex to analyze</span>
 			{:else}
 				<button class="hint-btn" onclick={() => game.fetchHint()}>Reveal</button>
 			{/if}
@@ -273,6 +284,14 @@
 		font-size: 0.8rem;
 		color: var(--text-dim, #6b6575);
 		font-style: italic;
+	}
+
+	.hint-caveat {
+		display: block;
+		font-size: 0.75rem;
+		color: var(--text-ghost, #3d3647);
+		font-style: italic;
+		margin-top: 0.25rem;
 	}
 
 	.tools-backdrop {

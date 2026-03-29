@@ -253,57 +253,41 @@ async fn handle_guess(
         }
     }
 
-    // Phase 2: Solve cache misses with a 10-second budget.
-    // Run in spawn_blocking to avoid blocking the tokio runtime.
+    // Phase 2: Solve cache misses on-demand with a hard 5-second deadline.
+    // The solver checks the cancellation flag periodically and aborts if hit.
     let mut any_timeout = false;
     if !unsolved.is_empty() {
-        let solver = Arc::clone(&length_data.solver);
-        let unsolved_parts: Vec<(usize, Vec<usize>)> = unsolved
-            .iter()
-            .map(|&i| (i, parts[i].1.clone()))
-            .collect();
-        let word_length = session.word_length;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for &i in &unsolved {
+            let solver = Arc::clone(&length_data.solver);
+            let indices = parts[i].1.clone();
+            let dl = deadline;
+            let result = tokio::task::spawn_blocking(move || {
+                let v = solver.solve_position_with_deadline(&indices, new_masked, Some(dl));
+                let cancelled = solver.was_cancelled();
+                (v, cancelled)
+            })
+            .await;
 
-        let results = tokio::task::spawn_blocking(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            let mut solved: Vec<(usize, Option<u32>)> = Vec::new();
-            let mut timed_out = false;
-            for (i, indices) in &unsolved_parts {
-                if std::time::Instant::now() >= deadline {
-                    timed_out = true;
-                    for (j, inds) in &unsolved_parts {
-                        if solved.iter().all(|(si, _)| si != j) {
-                            tracing::error!(
-                                "SOLVE TIMEOUT: partition of {} words (k={}, masked={:#x})",
-                                inds.len(),
-                                word_length,
-                                new_masked,
-                            );
-                        }
-                    }
-                    break;
-                }
-                let value = solver.solve_position(indices, new_masked);
-                solved.push((*i, Some(value)));
+            match result {
+                Ok((v, false)) => { values[i] = Some(v); }
+                _ => { any_timeout = true; }
             }
-            (solved, timed_out)
-        })
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("solve failed: {e}")))?;
-
-        for (i, v) in results.0 {
-            values[i] = v;
         }
-        any_timeout = results.1;
     }
 
     // Phase 3: Pick worst partition.
+    // For unsolved partitions, assume worst case (u32::MAX) so the referee
+    // never accidentally picks an easy partition over an unknown one.
     let mut best_idx = 0;
     let mut best_value = 0u32;
 
     for (i, (pmask, indices)) in parts.iter().enumerate() {
         let miss_cost = u32::from(*pmask == 0);
-        let value = miss_cost + values[i].unwrap_or(0);
+        let value = match values[i] {
+            Some(v) => miss_cost + v,
+            None => u32::MAX,
+        };
         if value > best_value || (value == best_value && indices.len() > parts[best_idx].1.len()) {
             best_value = value;
             best_idx = i;
@@ -463,44 +447,40 @@ async fn handle_hint(
         }
     }
 
-    // Solve uncached letters with a budget.
+    // Solve uncached letters with a 5-second deadline.
     let mut any_timeout = false;
     if !needs_solve.is_empty() {
-        let solve_data: Vec<(u8, Vec<(u32, Vec<usize>)>)> = needs_solve;
-        let solver2 = Arc::clone(&solver);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for (letter, parts) in needs_solve {
+            let solver2 = Arc::clone(&solver);
+            let new_masked = masked | letter_bit(letter);
+            let dl = deadline;
 
-        let results = tokio::task::spawn_blocking(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            let mut out: Vec<LetterEval> = Vec::new();
-            let mut timed_out = false;
-
-            for (letter, parts) in &solve_data {
-                if std::time::Instant::now() >= deadline {
-                    timed_out = true;
-                    break;
-                }
-                let new_masked = masked | letter_bit(*letter);
+            let result = tokio::task::spawn_blocking(move || {
                 let mut worst: u32 = 0;
-
-                for (pmask, indices) in parts {
+                let mut was_cancelled = false;
+                for (pmask, indices) in &parts {
                     let miss_cost = u32::from(*pmask == 0);
                     if indices.len() <= 1 {
                         worst = worst.max(miss_cost);
                         continue;
                     }
-                    let value = solver2.solve_position(indices, new_masked);
+                    let value = solver2.solve_position_with_deadline(indices, new_masked, Some(dl));
+                    if solver2.was_cancelled() {
+                        was_cancelled = true;
+                        break;
+                    }
                     worst = worst.max(miss_cost + value);
                 }
+                (worst, was_cancelled)
+            })
+            .await;
 
-                out.push(LetterEval { letter: *letter, value: Some(worst) });
+            match result {
+                Ok((worst, false)) => { evals.push(LetterEval { letter, value: Some(worst) }); }
+                _ => { any_timeout = true; }
             }
-            (out, timed_out)
-        })
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("solve failed: {e}")))?;
-
-        evals.extend(results.0);
-        any_timeout = results.1;
+        }
     }
 
     // Pick the letter with the lowest worst-case value (best for guesser).
