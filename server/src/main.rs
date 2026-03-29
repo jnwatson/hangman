@@ -64,11 +64,22 @@ struct GameSession {
     guesses_left: u32,
     game_over: bool,
     won: bool,
+    /// When this session was last accessed (for expiry).
+    last_active: std::time::Instant,
 }
+
+/// Maximum number of concurrent sessions.
+const MAX_SESSIONS: usize = 10_000;
+/// Sessions expire after this duration of inactivity.
+const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 struct AppState {
     lengths: HashMap<usize, LengthData>,
     sessions: DashMap<String, GameSession>,
+    /// Only one solver runs at a time on this single-vCPU machine.
+    solver_semaphore: tokio::sync::Semaphore,
+    /// The currently active solver (if any), so new requests can cancel it.
+    active_solver: std::sync::Mutex<Option<Arc<MemoizedSolver>>>,
 }
 
 // -- Request/Response types --
@@ -160,6 +171,11 @@ async fn handle_new_game(
     let game_id = Uuid::new_v4().to_string();
     let remaining: Vec<usize> = (0..length_data.words.len()).collect();
 
+    // Reject if too many sessions (memory protection).
+    if state.sessions.len() >= MAX_SESSIONS {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "server is busy, try again later"));
+    }
+
     let session = GameSession {
         word_length: params.length,
         remaining,
@@ -170,6 +186,7 @@ async fn handle_new_game(
         guesses_left: guesses_allowed,
         game_over: false,
         won: false,
+        last_active: std::time::Instant::now(),
     };
 
     state.sessions.insert(game_id.clone(), session);
@@ -191,6 +208,8 @@ async fn handle_guess(
         .sessions
         .get_mut(&req.game_id)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "game not found"))?;
+
+    session.last_active = std::time::Instant::now();
 
     if session.game_over {
         return Err(err(StatusCode::BAD_REQUEST, "game is over"));
@@ -254,25 +273,57 @@ async fn handle_guess(
     }
 
     // Phase 2: Solve cache misses on-demand with a hard 5-second deadline.
-    // The solver checks the cancellation flag periodically and aborts if hit.
+    // Only one solver runs at a time (1-vCPU machine). New guesses cancel
+    // any active solver to avoid blocking.
     let mut any_timeout = false;
     if !unsolved.is_empty() {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        for &i in &unsolved {
-            let solver = Arc::clone(&length_data.solver);
-            let indices = parts[i].1.clone();
-            let dl = deadline;
-            let result = tokio::task::spawn_blocking(move || {
-                let v = solver.solve_position_with_deadline(&indices, new_masked, Some(dl));
-                let cancelled = solver.was_cancelled();
-                (v, cancelled)
-            })
-            .await;
-
-            match result {
-                Ok((v, false)) => { values[i] = Some(v); }
-                _ => { any_timeout = true; }
+        // Cancel any active solver so the semaphore frees up quickly.
+        {
+            let active = state.active_solver.lock().unwrap();
+            if let Some(s) = active.as_ref() {
+                s.cancel();
             }
+        }
+
+        // Wait for the semaphore (cancelled solver finishes within ms).
+        let permit = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            state.solver_semaphore.acquire(),
+        ).await;
+
+        if let Ok(Ok(_permit)) = permit {
+            // Register ourselves as the active solver.
+            {
+                let mut active = state.active_solver.lock().unwrap();
+                *active = Some(Arc::clone(&length_data.solver));
+            }
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            for &i in &unsolved {
+                let solver = Arc::clone(&length_data.solver);
+                let indices = parts[i].1.clone();
+                let dl = deadline;
+                let result = tokio::task::spawn_blocking(move || {
+                    let v = solver.solve_position_with_deadline(&indices, new_masked, Some(dl));
+                    let cancelled = solver.was_cancelled();
+                    (v, cancelled)
+                })
+                .await;
+
+                match result {
+                    Ok((v, false)) => { values[i] = Some(v); }
+                    _ => { any_timeout = true; }
+                }
+            }
+
+            // Clear active solver.
+            {
+                let mut active = state.active_solver.lock().unwrap();
+                *active = None;
+            }
+        } else {
+            // Couldn't acquire semaphore — degrade all unsolved partitions.
+            any_timeout = true;
         }
     }
 
@@ -447,39 +498,58 @@ async fn handle_hint(
         }
     }
 
-    // Solve uncached letters with a 5-second deadline.
+    // Solve uncached letters — but only if the solver is free.
+    // Hints are optional; don't block if another request is solving.
     let mut any_timeout = false;
     if !needs_solve.is_empty() {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        for (letter, parts) in needs_solve {
-            let solver2 = Arc::clone(&solver);
-            let new_masked = masked | letter_bit(letter);
-            let dl = deadline;
-
-            let result = tokio::task::spawn_blocking(move || {
-                let mut worst: u32 = 0;
-                let mut was_cancelled = false;
-                for (pmask, indices) in &parts {
-                    let miss_cost = u32::from(*pmask == 0);
-                    if indices.len() <= 1 {
-                        worst = worst.max(miss_cost);
-                        continue;
-                    }
-                    let value = solver2.solve_position_with_deadline(indices, new_masked, Some(dl));
-                    if solver2.was_cancelled() {
-                        was_cancelled = true;
-                        break;
-                    }
-                    worst = worst.max(miss_cost + value);
-                }
-                (worst, was_cancelled)
-            })
-            .await;
-
-            match result {
-                Ok((worst, false)) => { evals.push(LetterEval { letter, value: Some(worst) }); }
-                _ => { any_timeout = true; }
+        let permit = state.solver_semaphore.try_acquire();
+        if let Ok(_permit) = permit {
+            // Register ourselves as the active solver.
+            {
+                let mut active = state.active_solver.lock().unwrap();
+                *active = Some(Arc::clone(&solver));
             }
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            for (letter, parts) in needs_solve {
+                let solver2 = Arc::clone(&solver);
+                let new_masked = masked | letter_bit(letter);
+                let dl = deadline;
+
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut worst: u32 = 0;
+                    let mut was_cancelled = false;
+                    for (pmask, indices) in &parts {
+                        let miss_cost = u32::from(*pmask == 0);
+                        if indices.len() <= 1 {
+                            worst = worst.max(miss_cost);
+                            continue;
+                        }
+                        let value = solver2.solve_position_with_deadline(indices, new_masked, Some(dl));
+                        if solver2.was_cancelled() {
+                            was_cancelled = true;
+                            break;
+                        }
+                        worst = worst.max(miss_cost + value);
+                    }
+                    (worst, was_cancelled)
+                })
+                .await;
+
+                match result {
+                    Ok((worst, false)) => { evals.push(LetterEval { letter, value: Some(worst) }); }
+                    _ => { any_timeout = true; break; }
+                }
+            }
+
+            // Clear active solver.
+            {
+                let mut active = state.active_solver.lock().unwrap();
+                *active = None;
+            }
+        } else {
+            // Solver is busy — return immediately with what we have.
+            return Err(err(StatusCode::SERVICE_UNAVAILABLE, "solver busy"));
         }
     }
 
@@ -584,7 +654,12 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState {
         lengths,
         sessions: DashMap::new(),
+        solver_semaphore: tokio::sync::Semaphore::new(1),
+        active_solver: std::sync::Mutex::new(None),
     });
+
+    // Background task: expire stale sessions every 5 minutes.
+    let cleanup_state = Arc::clone(&state);
 
     let mut app = Router::new()
         .route("/api/health", get(handle_health))
@@ -599,6 +674,20 @@ async fn main() -> Result<()> {
         info!("serving static files from {:?}", static_dir);
         app = app.fallback_service(ServeDir::new(static_dir));
     }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            let before = cleanup_state.sessions.len();
+            cleanup_state.sessions.retain(|_, session| {
+                session.last_active.elapsed() < SESSION_TTL
+            });
+            let expired = before - cleanup_state.sessions.len();
+            if expired > 0 {
+                info!("expired {} stale sessions ({} remaining)", expired, cleanup_state.sessions.len());
+            }
+        }
+    });
 
     let addr = format!("0.0.0.0:{}", cli.port);
     info!("listening on {}", addr);

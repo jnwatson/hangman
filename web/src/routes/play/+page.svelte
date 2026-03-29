@@ -77,6 +77,9 @@
 				{#if game.hintFailed}
 					<span class="hint-caveat">approximate — some positions too complex</span>
 				{/if}
+			{:else if game.hintBusy}
+				<span class="tool-dim">Server is busy — try again in a moment</span>
+				<button class="hint-btn hint-retry" onclick={() => game.fetchHint()}>Retry</button>
 			{:else if game.hintFailed}
 				<span class="tool-dim">Position too complex to analyze</span>
 			{:else}
@@ -259,6 +262,12 @@
 
 	.hint-btn:hover {
 		background: var(--purple-deep, #2d1b4e);
+	}
+
+	.hint-retry {
+		margin-top: 0.4rem;
+		font-size: 0.8rem;
+		padding: 0.25rem 0.6rem;
 	}
 
 	.hint-loading {

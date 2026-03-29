@@ -77,9 +77,11 @@
 	<section class="about-section">
 		<h2>Dictionary</h2>
 		<p>
-			Dead Letters uses the <a href="https://norvig.com/ngrams/enable1.txt" class="inline-link">enable1</a> word list (172,820 words), a
-			standard competitive Scrabble dictionary. The full word list is available in
-			the hints panel during play.
+			Dead Letters uses the <a href="https://norvig.com/ngrams/enable1.txt" class="inline-link">enable1</a> word list (172,819 words). ENABLE
+			(Enhanced North American Benchmark Lexicon) was compiled by Mendel Leo Cooper and
+			Alan Beale in 1997 as a public domain alternative to the copyrighted Official
+			Scrabble Players Dictionary. The full word list is available in the hints panel
+			during play.
 		</p>
 	</section>
 

@@ -241,17 +241,22 @@ impl MemoizedSolver {
         let data = Arc::clone(guard.as_ref().expect("solver not initialized for serving"));
         drop(guard);
 
+        let solve_gen = data.generation.fetch_add(1, Ordering::Relaxed) + 1;
         data.cancelled.store(false, Ordering::Relaxed);
 
         // If a deadline is set, spawn a watchdog thread that cancels the solve.
+        // The watchdog checks the generation counter to avoid cancelling a
+        // later solve that reused this solver instance.
         let _watchdog = deadline.map(|dl| {
-            let cancelled = Arc::clone(&data);
+            let watchdog_data = Arc::clone(&data);
             std::thread::spawn(move || {
                 let now = std::time::Instant::now();
                 if let Some(remaining) = dl.checked_duration_since(now) {
                     std::thread::sleep(remaining);
                 }
-                cancelled.cancelled.store(true, Ordering::Relaxed);
+                if watchdog_data.generation.load(Ordering::Relaxed) == solve_gen {
+                    watchdog_data.cancelled.store(true, Ordering::Relaxed);
+                }
             })
         });
 
@@ -259,11 +264,20 @@ impl MemoizedSolver {
         inner.solve_subset(indices, masked, 0, u32::MAX)
     }
 
-    /// Check if the last solve was cancelled (hit deadline).
+    /// Check if the last solve was cancelled (hit deadline or external cancel).
     #[must_use]
     pub fn was_cancelled(&self) -> bool {
         let guard = self.active_data.lock().unwrap();
         guard.as_ref().map_or(false, |d| d.cancelled.load(Ordering::Relaxed))
+    }
+
+    /// Cancel the currently running solve (if any). The solver will notice
+    /// this at the next cancellation checkpoint and return quickly.
+    pub fn cancel(&self) {
+        let guard = self.active_data.lock().unwrap();
+        if let Some(data) = guard.as_ref() {
+            data.cancelled.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Warm the cache for serving: ensure every reachable position has an
@@ -731,6 +745,9 @@ struct SolverData {
     history: [AtomicU32; 26],
     /// Cancellation flag: when set, helper threads should exit early.
     cancelled: AtomicBool,
+    /// Generation counter: incremented each time a new solve starts.
+    /// Watchdog threads compare this to avoid cancelling a later solve.
+    generation: AtomicU64,
     /// Progress stack for ETA estimation. Only written by the main OS thread,
     /// read by an external reporter. The Mutex is uncontested during solving
     /// and only briefly held when reading.
@@ -795,6 +812,7 @@ impl SolverData {
             freq_rank,
             history: std::array::from_fn(|_| AtomicU32::new(0)),
             cancelled: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
             progress: std::sync::Mutex::new(Vec::new()),
             solve_start: Instant::now(),
             main_thread_id: std::thread::current().id(),
@@ -1348,6 +1366,10 @@ impl MemoizedSolverInner {
         // when present, since non-required letters risk a miss).
         let (masked, required_splitting) = self.analyze_required_letters(indices, masked);
 
+        if self.data.cancelled.load(Ordering::Relaxed) {
+            return beta;
+        }
+
         // Quick pruning via miss-chain lower bound before expensive canonicalization.
         // When no required-splitting letters exist, every unmasked letter risks a
         // miss — the referee can always pick the miss partition.
@@ -1373,6 +1395,10 @@ impl MemoizedSolverInner {
                     return 1;
                 }
             }
+        }
+
+        if self.data.cancelled.load(Ordering::Relaxed) {
+            return beta;
         }
 
         // Fast key cache: map (indices, masked) → canonical_key. On cache
@@ -1447,6 +1473,10 @@ impl MemoizedSolverInner {
                 .cache
                 .insert(cache_key, cache_pack(val, 0, BOUND_EXACT));
             return val;
+        }
+
+        if self.data.cancelled.load(Ordering::Relaxed) {
+            return beta;
         }
 
         let mut letters = self.select_letters(&indices, masked, required_splitting);
@@ -1554,6 +1584,9 @@ impl MemoizedSolverInner {
         let mut best = u32::MAX;
         let mut best_letter = letters[0];
         for &letter in letters {
+            if self.data.cancelled.load(Ordering::Relaxed) {
+                break;
+            }
             let cutoff = best.min(beta);
             let val = self.evaluate_letter(indices, masked, letter, cutoff);
             if val < best {
@@ -1604,6 +1637,9 @@ impl MemoizedSolverInner {
         let rest = letters[1..]
             .par_iter()
             .map(|&letter| {
+                if self.data.cancelled.load(Ordering::Relaxed) {
+                    return (u32::MAX, letter);
+                }
                 let current_cutoff = shared_cutoff.load(Ordering::Relaxed);
                 if current_cutoff == 0 || current_cutoff <= alpha {
                     return (u32::MAX, letter);
@@ -1663,6 +1699,9 @@ impl MemoizedSolverInner {
 
         let mut established = false;
         for &(pos_mask, ref subset) in &ordered {
+            if self.data.cancelled.load(Ordering::Relaxed) {
+                return cutoff;
+            }
             let miss_cost = u32::from(pos_mask == 0);
 
             // If miss_cost alone meets cutoff, prune without recursion.

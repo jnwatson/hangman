@@ -162,6 +162,12 @@ ssh "$HOST" "sudo systemctl daemon-reload && sudo systemctl enable dead-letters 
 echo "  Service started"
 
 echo ""
+echo "=== Updating nginx config ==="
+rsync -avz "$SCRIPT_DIR/nginx/dead-letters" "$HOST:/tmp/dead-letters-nginx"
+ssh "$HOST" "sudo cp /tmp/dead-letters-nginx /etc/nginx/sites-enabled/dead-letters && rm /tmp/dead-letters-nginx && sudo nginx -t && sudo systemctl reload nginx"
+echo "  nginx reloaded"
+
+echo ""
 echo "=== Verifying ==="
 sleep 2
 ssh "$HOST" "sudo systemctl status dead-letters --no-pager | head -12"

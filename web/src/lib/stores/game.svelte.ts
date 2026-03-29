@@ -61,6 +61,7 @@ export function createGameState() {
 		error = null;
 		hint = null;
 		hintFailed = false;
+		hintBusy = false;
 		_started = true;
 
 		if (MOCK) {
@@ -119,6 +120,7 @@ export function createGameState() {
 		error = null;
 		hint = null;
 		hintFailed = false;
+		hintBusy = false;
 
 		if (MOCK) {
 			state.guessedLetters = new Set([...state.guessedLetters, letter]);
@@ -201,6 +203,7 @@ export function createGameState() {
 	let hint = $state<{ letter: string; value: number | null } | null>(null);
 	let hintLoading = $state(false);
 	let hintFailed = $state(false);
+	let hintBusy = $state(false);
 	let hintAbort: AbortController | null = null;
 
 	function cancelHint() {
@@ -216,12 +219,17 @@ export function createGameState() {
 		cancelHint();
 		hintLoading = true;
 		hintFailed = false;
+		hintBusy = false;
 		hint = null;
 		hintAbort = new AbortController();
 		try {
 			const res = await fetch(`${API_BASE}/hint?game_id=${state.gameId}`, {
 				signal: hintAbort.signal,
 			});
+			if (res.status === 503) {
+				hintBusy = true;
+				return;
+			}
 			if (!res.ok) throw new Error(await res.text());
 			const data = await res.json();
 			if (data.letter) {
@@ -247,6 +255,7 @@ export function createGameState() {
 		get hint() { return hint; },
 		get hintLoading() { return hintLoading; },
 		get hintFailed() { return hintFailed; },
+		get hintBusy() { return hintBusy; },
 		newGame,
 		guess,
 		fetchHint,
