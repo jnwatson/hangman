@@ -361,9 +361,14 @@ async fn handle_guess(
     session.remaining = best_indices.clone();
 
     let positions = if best_partition_mask == 0 {
-        // Miss.
+        // Miss: lose if no budget remaining, otherwise decrement.
         session.wrong_letters.push(letter);
-        session.guesses_left = session.guesses_left.saturating_sub(1);
+        if session.guesses_left == 0 {
+            session.game_over = true;
+            session.won = false;
+        } else {
+            session.guesses_left -= 1;
+        }
         None
     } else {
         // Hit: reveal letter at positions.
@@ -377,11 +382,8 @@ async fn handle_guess(
         Some(pos_list)
     };
 
-    // Check game over conditions.
-    if session.guesses_left == 0 {
-        session.game_over = true;
-        session.won = false;
-    } else if !session.pattern.contains(&b'_') {
+    // Check win condition.
+    if !session.game_over && !session.pattern.contains(&b'_') {
         session.game_over = true;
         session.won = true;
     }

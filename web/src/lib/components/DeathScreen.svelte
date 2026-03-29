@@ -56,8 +56,8 @@
 				<div class="minimax-note">
 					<p>
 						No strategy can beat this game with fewer than
-						<strong>{minimaxValue}</strong>
-						{minimaxValue === 1 ? 'miss' : 'misses'}.
+						<strong>{minimaxValue + 1}</strong>
+						{minimaxValue + 1 === 1 ? 'miss' : 'misses'}.
 					</p>
 				</div>
 			{/if}

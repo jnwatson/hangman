@@ -102,13 +102,15 @@
 		<!-- Center: Game Area -->
 		<main class="game-center">
 			<div class="game-header">
-				<button class="hints-toggle" onclick={() => toolsOpen = !toolsOpen}>Hints</button>
+				<button class="hints-toggle" onclick={() => toolsOpen = !toolsOpen}>
+					<span class="hints-chevron" class:open={toolsOpen}>&#x25B8;</span> Hints
+				</button>
 				<h1 class="game-title">
 					<span class="title-dead">Dead</span> <span class="title-letters">Letters</span>
 				</h1>
 				<div class="guesses-left" class:danger={game.state.guessesLeft <= 2}>
-					<span class="guesses-label">Guesses left</span>
-					<span class="guesses-number">{game.state.guessesLeft}</span>
+					<span class="guesses-label">Misses left</span>
+					<span class="guesses-number">{game.state.guessesLeft < 0 ? 'DEAD' : game.state.guessesLeft}</span>
 				</div>
 			</div>
 
@@ -186,6 +188,16 @@
 
 	.hints-toggle:hover {
 		color: var(--purple-glow, #9b6dd7);
+	}
+
+	.hints-chevron {
+		display: inline-block;
+		transition: transform 0.2s;
+		font-size: 0.8em;
+	}
+
+	.hints-chevron.open {
+		transform: rotate(90deg);
 	}
 
 	/* ---- TOOLS DRAWER ---- */

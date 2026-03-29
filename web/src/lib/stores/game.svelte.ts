@@ -134,20 +134,21 @@ export function createGameState() {
 					state.pattern[pos] = letter.toUpperCase();
 				}
 			} else {
+				// Miss: lose if no budget remaining, otherwise decrement.
 				state.wrongLetters = [...state.wrongLetters, letter.toUpperCase()];
-				state.guessesLeft--;
+				if (state.guessesLeft <= 0) {
+					state.gameOver = true;
+					state.won = false;
+					state.exampleWord = _mockWord;
+				} else {
+					state.guessesLeft--;
+				}
 			}
 
 			// Check win
-			if (!state.pattern.includes('_')) {
+			if (!state.gameOver && !state.pattern.includes('_')) {
 				state.gameOver = true;
 				state.won = true;
-				state.exampleWord = _mockWord;
-			}
-			// Check loss
-			if (state.guessesLeft <= 0) {
-				state.gameOver = true;
-				state.won = false;
 				state.exampleWord = _mockWord;
 			}
 
@@ -172,9 +173,9 @@ export function createGameState() {
 				}
 			} else {
 				state.wrongLetters = [...state.wrongLetters, letter.toUpperCase()];
-				state.guessesLeft--;
 			}
 
+			state.guessesLeft = data.guesses_left;
 			state.gameOver = data.game_over;
 			state.won = data.won ?? false;
 			if (data.example_word) {

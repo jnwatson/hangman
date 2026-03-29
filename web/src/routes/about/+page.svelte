@@ -23,35 +23,35 @@
 	<section class="about-section">
 		<h2>Can I actually win?</h2>
 		<p>
-			No. The game allows you one fewer miss than the theoretical minimum, so
+			No. The game allows you one fewer miss than needed to win, so
 			even with perfect play, the referee will always hang you. The table below
-			shows the minimum number of wrong guesses required for each word length
+			shows the minimum misses needed to win for each word length
 			&mdash; you get one fewer than that.
 		</p>
 
 		<div class="results-table-wrap">
 			<table class="results-table">
 				<thead>
-					<tr><th>Length</th><th>Words</th><th>Min. Misses</th></tr>
+					<tr><th>Length</th><th>Words</th><th>Misses to Win</th></tr>
 				</thead>
 				<tbody>
-					<tr><td>3</td><td>972</td><td>17</td></tr>
-					<tr><td>4</td><td>3,903</td><td>16</td></tr>
-					<tr><td>5</td><td>8,636</td><td>15</td></tr>
-					<tr><td>6</td><td>15,232</td><td>12</td></tr>
-					<tr><td>7</td><td>23,109</td><td>11</td></tr>
-					<tr><td>8</td><td>28,420</td><td>8</td></tr>
-					<tr><td>9</td><td>24,873</td><td>6</td></tr>
-					<tr><td>10</td><td>20,300</td><td>5</td></tr>
-					<tr><td>11</td><td>15,504</td><td>6</td></tr>
-					<tr><td>12</td><td>11,357</td><td>4</td></tr>
-					<tr><td>13</td><td>7,827</td><td>4</td></tr>
-					<tr><td>14</td><td>5,127</td><td>3</td></tr>
+					<tr><td>3</td><td>972</td><td>18</td></tr>
+					<tr><td>4</td><td>3,903</td><td>17</td></tr>
+					<tr><td>5</td><td>8,636</td><td>16</td></tr>
+					<tr><td>6</td><td>15,232</td><td>13</td></tr>
+					<tr><td>7</td><td>23,109</td><td>12</td></tr>
+					<tr><td>8</td><td>28,420</td><td>9</td></tr>
+					<tr><td>9</td><td>24,873</td><td>7</td></tr>
+					<tr><td>10</td><td>20,300</td><td>6</td></tr>
+					<tr><td>11</td><td>15,504</td><td>7</td></tr>
+					<tr><td>12</td><td>11,357</td><td>5</td></tr>
+					<tr><td>13</td><td>7,827</td><td>5</td></tr>
+					<tr><td>14</td><td>5,127</td><td>4</td></tr>
 				</tbody>
 			</table>
 		</div>
 		<p class="table-note">
-			Longer words are easier. At 20+ letters, only 1 miss is needed.
+			Longer words are easier. At 20+ letters, only 2 misses are needed.
 		</p>
 	</section>
 
