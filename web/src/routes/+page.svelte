@@ -26,6 +26,7 @@
 
 	<footer class="landing-footer">
 		<p class="footer-whisper">You will not win.</p>
+		<a href="/about" class="about-link">What is this?</a>
 	</footer>
 </div>
 
@@ -148,6 +149,20 @@
 		font-size: 0.9rem;
 		color: var(--text-ghost);
 		animation: pulse 4s ease-in-out infinite;
+	}
+
+	.about-link {
+		display: block;
+		margin-top: 0.75rem;
+		font-family: var(--font-body);
+		font-size: 0.85rem;
+		color: var(--text-ghost);
+		text-decoration: none;
+		transition: color 0.2s;
+	}
+
+	.about-link:hover {
+		color: var(--purple-glow);
 	}
 
 	/* Fog layers */

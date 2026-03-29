@@ -66,6 +66,8 @@
 		<button class="play-again-btn" onclick={onplayagain}>
 			{won ? 'PLAY AGAIN' : 'TRY AGAIN'}
 		</button>
+
+		<a href="/about" class="about-link">How does this work?</a>
 	</div>
 </div>
 
@@ -207,5 +209,19 @@
 	.play-again-btn:hover {
 		background: var(--accent-blue-glow, #5b9fd4);
 		transform: scale(1.05);
+	}
+
+	.about-link {
+		display: inline-block;
+		margin-top: 1rem;
+		font-family: var(--font-body, Georgia, serif);
+		font-size: 0.85rem;
+		color: var(--text-ghost, #3d3647);
+		text-decoration: none;
+		transition: color 0.2s;
+	}
+
+	.about-link:hover {
+		color: var(--purple-glow, #9b6dd7);
 	}
 </style>
