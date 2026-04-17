@@ -33,6 +33,10 @@ path = "src/bin/warm_bench.rs"
 name = "tt-coverage"
 path = "src/bin/tt_coverage.rs"
 
+[[bin]]
+name = "merge-caches"
+path = "src/bin/merge_caches.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1

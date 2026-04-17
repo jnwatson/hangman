@@ -9,7 +9,8 @@
 //! Positions already present (EXACT) in the disk cache are skipped,
 //! making the binary resumable after interruption.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -49,6 +50,36 @@ struct Cli {
     /// Skip positions with more than this many words
     #[arg(long)]
     max_words: Option<usize>,
+
+    /// Process only positions where `index % N == i`. Format: "i/N" (e.g. "2/4"
+    /// means this machine handles positions 2, 6, 10, ... out of every 4).
+    /// The `positions` list is deterministic across machines given the same
+    /// dict/length/depth, so modulo sharding produces non-overlapping slices.
+    #[arg(long)]
+    shard: Option<String>,
+}
+
+/// Parse a `--shard` argument of the form `"i/N"`. Returns `(i, N)`.
+///
+/// # Errors
+/// - missing slash
+/// - non-integer parts
+/// - `N` is zero
+/// - `i >= N`
+fn parse_shard(s: &str) -> Result<(usize, usize)> {
+    let (i_str, n_str) = s.split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("--shard must be i/N (e.g. 2/4), got {s:?}"))?;
+    let i: usize = i_str.parse()
+        .map_err(|e| anyhow::anyhow!("--shard i not an integer ({s:?}): {e}"))?;
+    let n: usize = n_str.parse()
+        .map_err(|e| anyhow::anyhow!("--shard N not an integer ({s:?}): {e}"))?;
+    if n == 0 {
+        anyhow::bail!("--shard N must be ≥ 1, got {s:?}");
+    }
+    if i >= n {
+        anyhow::bail!("--shard i must be < N, got {s:?}");
+    }
+    Ok((i, n))
 }
 
 /// Partition word indices by their positional pattern for a given letter.
@@ -97,11 +128,18 @@ fn solve_and_flush(
     let start = Instant::now();
     let value = solver.solve_position_smp(words, indices, masked);
     let elapsed = start.elapsed();
-    let flushed = solver.flush_to_disk().unwrap_or(Ok(0)).unwrap_or(0);
+    let flushed = match solver.flush_to_disk() {
+        Some(Ok(n)) => n,
+        Some(Err(e)) => {
+            eprintln!("  WARNING: flush_to_disk failed: {e:#}");
+            0
+        }
+        None => 0,
+    };
     (value, elapsed, flushed)
 }
 
-/// Collect all positions at depth 1 and 2, sorted largest first.
+/// Collect all positions up to `max_depth`, sorted largest first.
 struct Position {
     label: String,
     indices: Vec<usize>,
@@ -114,57 +152,89 @@ fn collect_positions(
     max_depth: usize,
 ) -> Vec<Position> {
     let mut positions = Vec::new();
-
-    // Depth 1: partition by each letter
-    for li in 0..26u8 {
-        let letter = b'a' + li;
-        let masked = letter_bit(letter);
-        let parts = partition_by_letter(words, all_indices, letter);
-        for (pmask, indices) in &parts {
-            if indices.len() <= 1 {
-                continue;
-            }
-            let ch = letter as char;
-            let kind = if *pmask == 0 { "miss" } else { "hit" };
-            positions.push(Position {
-                label: format!("d1 '{ch}' {kind}({pmask:#x}) {}", indices.len()),
-                indices: indices.clone(),
-                masked,
-            });
-
-            // Depth 2: for each depth-1 partition, partition by remaining letters
-            if max_depth >= 2 {
-                for li2 in 0..26u8 {
-                    if li2 == li {
-                        continue;
-                    }
-                    let letter2 = b'a' + li2;
-                    let masked2 = masked | letter_bit(letter2);
-                    let parts2 = partition_by_letter(words, indices, letter2);
-                    for (pmask2, indices2) in &parts2 {
-                        if indices2.len() <= 1 {
-                            continue;
-                        }
-                        let ch2 = letter2 as char;
-                        let kind2 = if *pmask2 == 0 { "miss" } else { "hit" };
-                        positions.push(Position {
-                            label: format!(
-                                "d2 '{ch}'{kind}+'{ch2}'{kind2} {}",
-                                indices2.len()
-                            ),
-                            indices: indices2.clone(),
-                            masked: masked2,
-                        });
-                    }
-                }
-            }
-        }
-    }
+    let path = String::new();
+    collect_recursive(words, all_indices, 0, max_depth, &path, &mut positions);
 
     // Sort largest first — they benefit most from precomputation, and their
     // TT entries help solve smaller positions via L2.
     positions.sort_by(|a, b| b.indices.len().cmp(&a.indices.len()));
+
+    // Deduplicate — different guess orderings can produce the same word set
+    // (e.g., 'e'hit+'q'miss == 'q'miss+'e'hit). Hash (masked, indices) as a
+    // fast proxy for canonical equivalence.
+    let before = positions.len();
+    let mut seen = HashSet::new();
+    positions.retain(|pos| {
+        let mut h = std::hash::DefaultHasher::new();
+        pos.masked.hash(&mut h);
+        pos.indices.hash(&mut h);
+        seen.insert(h.finish())
+    });
+    let dupes = before - positions.len();
+    if dupes > 0 {
+        println!("  Removed {dupes} duplicate positions ({before} -> {})", positions.len());
+    }
+
     positions
+}
+
+fn collect_recursive(
+    words: &[Vec<u8>],
+    indices: &[usize],
+    masked: u32,
+    depth_remaining: usize,
+    path: &str,
+    out: &mut Vec<Position>,
+) {
+    if depth_remaining == 0 {
+        return;
+    }
+    let depth = path.chars().filter(|&c| c == '+').count() + 1;
+
+    for li in 0..26u8 {
+        let letter = b'a' + li;
+        if masked & letter_bit(letter) != 0 {
+            continue;
+        }
+        let new_masked = masked | letter_bit(letter);
+        let parts = partition_by_letter(words, indices, letter);
+        for (pmask, part_indices) in &parts {
+            if part_indices.len() <= 1 {
+                continue;
+            }
+            let ch = letter as char;
+            let kind = if *pmask == 0 { "miss" } else { "hit" };
+            let label = if path.is_empty() {
+                format!("d{depth} '{ch}' {kind}({pmask:#x}) {}", part_indices.len())
+            } else {
+                format!(
+                    "d{depth} {path}+'{ch}'{kind} {}",
+                    part_indices.len()
+                )
+            };
+            out.push(Position {
+                label,
+                indices: part_indices.clone(),
+                masked: new_masked,
+            });
+
+            if depth_remaining > 1 {
+                let sub_path = if path.is_empty() {
+                    format!("'{ch}'{kind}")
+                } else {
+                    format!("{path}+'{ch}'{kind}")
+                };
+                collect_recursive(
+                    words,
+                    part_indices,
+                    new_masked,
+                    depth_remaining - 1,
+                    &sub_path,
+                    out,
+                );
+            }
+        }
+    }
 }
 
 fn rss_gb() -> f64 {
@@ -179,6 +249,14 @@ fn rss_gb() -> f64 {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    let (shard_i, shard_n) = match cli.shard.as_deref() {
+        Some(s) => parse_shard(s)?,
+        None => (0, 1),
+    };
+    if shard_n > 1 {
+        println!("Shard: {shard_i}/{shard_n} (processing positions where index % {shard_n} == {shard_i})\n");
+    }
+
     let dict = Dictionary::from_file(&cli.dict)?;
     println!("Loaded {} words\n", dict.total_words());
 
@@ -190,7 +268,7 @@ fn main() -> Result<()> {
         }
         println!("=== k={len}: {} words ===", words.len());
 
-        let map_size = 16 * 1024 * 1024 * 1024;
+        let map_size = 256 * 1024 * 1024 * 1024;
         let dc = Arc::new(DiskCache::open(&cli.cache_dir, len, &words, map_size)?);
         println!("  Disk cache: {} entries", dc.entry_count());
 
@@ -206,7 +284,12 @@ fn main() -> Result<()> {
         println!("  {} positions to check (depth 1..={})", total, cli.depth);
 
         let mut too_large = 0usize;
+        let mut not_my_shard = 0usize;
         for (i, pos) in positions.iter().enumerate() {
+            if shard_n > 1 && i % shard_n != shard_i {
+                not_my_shard += 1;
+                continue;
+            }
             if let Some(max) = cli.max_words {
                 if pos.indices.len() > max {
                     too_large += 1;
@@ -236,11 +319,75 @@ fn main() -> Result<()> {
         }
 
         let wall = wall_start.elapsed();
+        let shard_note = if shard_n > 1 {
+            format!(", {not_my_shard} skipped (other shard)")
+        } else {
+            String::new()
+        };
         println!(
-            "  Done: {solved} solved, {skipped} cached, {too_large} skipped (too large), {total_flushed} entries flushed, {wall:.1?} total",
+            "  Done: {solved} solved, {skipped} cached, {too_large} skipped (too large){shard_note}, {total_flushed} entries flushed, {wall:.1?} total",
         );
         println!("  Disk cache now: {} entries\n", dc.entry_count());
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_shard_valid() {
+        assert_eq!(parse_shard("0/1").unwrap(), (0, 1));
+        assert_eq!(parse_shard("0/4").unwrap(), (0, 4));
+        assert_eq!(parse_shard("3/4").unwrap(), (3, 4));
+        assert_eq!(parse_shard("7/8").unwrap(), (7, 8));
+    }
+
+    #[test]
+    fn parse_shard_missing_slash() {
+        let err = parse_shard("4").unwrap_err().to_string();
+        assert!(err.contains("i/N"), "msg: {err}");
+    }
+
+    #[test]
+    fn parse_shard_zero_n() {
+        let err = parse_shard("0/0").unwrap_err().to_string();
+        assert!(err.contains("N must be"), "msg: {err}");
+    }
+
+    #[test]
+    fn parse_shard_i_out_of_range() {
+        let err = parse_shard("4/4").unwrap_err().to_string();
+        assert!(err.contains("i must be"), "msg: {err}");
+        assert!(parse_shard("5/4").is_err());
+    }
+
+    #[test]
+    fn parse_shard_non_integer() {
+        assert!(parse_shard("a/4").is_err());
+        assert!(parse_shard("2/b").is_err());
+        assert!(parse_shard("-1/4").is_err());
+    }
+
+    /// For any deterministic position list, sharding produces a disjoint
+    /// partition whose union equals the full list.
+    #[test]
+    fn shard_partitions_positions_disjointly() {
+        let positions: Vec<usize> = (0..100).collect();
+        for n in [1usize, 2, 3, 4, 5, 8, 10] {
+            let mut covered: Vec<usize> = Vec::new();
+            for i in 0..n {
+                for (idx, _) in positions.iter().enumerate() {
+                    if idx % n == i {
+                        covered.push(idx);
+                    }
+                }
+            }
+            covered.sort_unstable();
+            let expected: Vec<usize> = (0..100).collect();
+            assert_eq!(covered, expected, "n={n}: shards did not cover all positions exactly once");
+        }
+    }
 }
