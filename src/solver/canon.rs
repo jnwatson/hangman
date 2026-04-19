@@ -430,29 +430,95 @@ fn sort_flat_cols(buf: &mut [u8], m: usize, k: usize) {
 
 /// Canonicalize a flat buffer whose rows are already sorted from dedup.
 ///
-/// Uses letter-only canonicalization: relabel → sort → relabel → hash.
-/// Column permutation and merging were tested but provide negligible cache
-/// reduction for real English dictionaries while adding significant overhead.
+/// Steps:
+/// 1. Drop all-zero columns (dead positions). Two states that differ only in
+///    which position is "dead" share game structure, so they should share a
+///    TT entry. Specifically, when a precompute top-level guess hits on
+///    letter L at position P for all N remaining words, position P becomes
+///    permanently 0 for all sub-problems; canonicalizing to a (k-1)-column
+///    form collapses this whole sub-tree with its symmetric peers.
+/// 2. Letter-only canonicalization: relabel → sort → relabel → hash.
+///
+/// Column permutation was tested separately and found net-negative for real
+/// English dictionaries, so we don't do it here — we only drop columns that
+/// are provably dead across all rows.
 fn canonicalize_sorted_rows(buf: &mut [u8], m: usize, k: usize) -> u128 {
     if m <= 1 || k == 0 {
         return 0;
     }
 
-    // Rows already sorted from dedup. Relabel → sort → relabel → hash.
-    // Skip the second sort if relabel didn't change order.
-    let total = m * k;
-    let mut tmp = vec![0u8; total];
-    let mut indices: Vec<usize> = (0..m).collect();
-    relabel_flat(buf);
-
-    // Check if still sorted after relabeling.
-    let needs_resort = (1..m).any(|i| buf[(i - 1) * k..i * k] > buf[i * k..(i + 1) * k]);
-    if needs_resort {
-        sort_flat_rows(buf, &mut tmp, &mut indices, m, k);
-        relabel_flat(buf);
+    // Drop all-zero columns if present. Operates on a slice because when all
+    // columns are live we can skip allocation entirely.
+    let (buf, k) = match collapse_zero_cols(buf, m, k) {
+        Some((owned, ek)) => (owned, ek),
+        None => (buf[..m * k].to_vec(), k),
+    };
+    if k == 0 {
+        // All columns were dead — all sigs are empty. Distinct rows are
+        // impossible here (they would have had the same u64 key and been
+        // deduped). Return 0 as the canonical hash of "zero useful state."
+        return 0;
     }
 
-    hash_flat(buf)
+    let total = m * k;
+    let mut buf = buf;
+    let mut tmp = vec![0u8; total];
+    let mut indices: Vec<usize> = (0..m).collect();
+    relabel_flat(&mut buf);
+
+    let needs_resort = (1..m).any(|i| buf[(i - 1) * k..i * k] > buf[i * k..(i + 1) * k]);
+    if needs_resort {
+        sort_flat_rows(&mut buf, &mut tmp, &mut indices, m, k);
+        relabel_flat(&mut buf);
+    }
+
+    hash_flat(&buf)
+}
+
+/// Check for all-zero columns in a row-major m×k buffer. Returns `None` if
+/// all columns have at least one non-zero byte. Otherwise returns an
+/// `m × live_k` buffer with the dead columns removed (`live_k` = columns
+/// that had at least one non-zero byte).
+///
+/// Preserves row order: since dead columns have byte 0 in every row, they
+/// can't affect lex ordering of rows, so post-collapse rows are still sorted
+/// if the pre-collapse rows were.
+fn collapse_zero_cols(buf: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, usize)> {
+    if k == 0 || m == 0 {
+        return None;
+    }
+
+    let mut live = 0u64;
+    debug_assert!(k <= 64, "collapse_zero_cols assumes k fits in u64 bitmask");
+    for i in 0..m {
+        let row = &buf[i * k..(i + 1) * k];
+        for (j, &b) in row.iter().enumerate() {
+            if b != 0 {
+                live |= 1u64 << j;
+            }
+        }
+        // Early exit: every column already has a non-zero byte.
+        if live.count_ones() as usize == k {
+            return None;
+        }
+    }
+
+    let new_k = live.count_ones() as usize;
+    if new_k == k {
+        return None;
+    }
+
+    let mut out = vec![0u8; m * new_k];
+    for i in 0..m {
+        let mut w = 0usize;
+        for j in 0..k {
+            if live & (1u64 << j) != 0 {
+                out[i * new_k + w] = buf[i * k + j];
+                w += 1;
+            }
+        }
+    }
+    Some((out, new_k))
 }
 
 /// Try all ek! column permutations, canonicalize each, return min hash.
@@ -787,6 +853,79 @@ mod tests {
         let a = vec![b"ba".to_vec(), b"ca".to_vec()];
         let b = vec![b"ab".to_vec(), b"ac".to_vec()];
         assert_eq!(canonicalize(&a), canonicalize(&b));
+    }
+
+    #[test]
+    fn collapse_zero_cols_identifies_all_dead_columns() {
+        // 3 rows, 4 cols, col 1 is all-zero.
+        let buf = vec![
+            1, 0, 2, 3,
+            1, 0, 4, 5,
+            6, 0, 7, 8,
+        ];
+        let (out, new_k) = collapse_zero_cols(&buf, 3, 4).unwrap();
+        assert_eq!(new_k, 3);
+        assert_eq!(out, vec![1, 2, 3, 1, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn collapse_zero_cols_no_dead_returns_none() {
+        let buf = vec![1, 2, 3, 4, 5, 6];
+        assert!(collapse_zero_cols(&buf, 2, 3).is_none());
+    }
+
+    #[test]
+    fn collapse_zero_cols_multiple_dead() {
+        // 2 rows, 4 cols, cols 0 and 2 are all-zero.
+        let buf = vec![
+            0, 1, 0, 2,
+            0, 3, 0, 4,
+        ];
+        let (out, new_k) = collapse_zero_cols(&buf, 2, 4).unwrap();
+        assert_eq!(new_k, 2);
+        assert_eq!(out, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn collapse_zero_cols_all_dead() {
+        let buf = vec![0, 0, 0, 0, 0, 0];
+        let (out, new_k) = collapse_zero_cols(&buf, 2, 3).unwrap();
+        assert_eq!(new_k, 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn canonicalize_dead_col_merges_with_k_minus_one() {
+        // Two word sets with the same effective structure but in one, the dead
+        // column is at position 2 (k=4) and in the other it's a genuine k=3
+        // set. These should hash to the same canonical form since the dead
+        // column contributes no game-relevant information.
+        let with_dead_col = vec![
+            vec![1, 2, 0, 3],
+            vec![1, 2, 0, 4],
+            vec![5, 2, 0, 3],
+        ];
+        let no_dead_col = vec![
+            vec![1, 2, 3],
+            vec![1, 2, 4],
+            vec![5, 2, 3],
+        ];
+        assert_eq!(canonical_hash(&with_dead_col), canonical_hash(&no_dead_col));
+    }
+
+    #[test]
+    fn canonicalize_dead_col_position_invariance() {
+        // Same 3-column structure, but in one the dead col is at position 0,
+        // in the other at position 2. Both should collapse to the same hash.
+        let dead_at_0 = vec![
+            vec![0, 1, 2, 3],
+            vec![0, 1, 2, 4],
+        ];
+        let dead_at_2 = vec![
+            vec![1, 2, 0, 3],
+            vec![1, 2, 0, 4],
+        ];
+        assert_eq!(canonical_hash(&dead_at_0), canonical_hash(&dead_at_2));
     }
 
     #[test]
