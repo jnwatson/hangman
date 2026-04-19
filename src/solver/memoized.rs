@@ -237,6 +237,16 @@ impl MemoizedSolver {
         if indices.len() <= 1 {
             return 0;
         }
+        // If the deadline has already passed, mark as cancelled and return.
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                let guard = self.active_data.lock().unwrap();
+                if let Some(data) = guard.as_ref() {
+                    data.cancelled.store(true, Ordering::Relaxed);
+                }
+                return u32::MAX;
+            }
+        }
         let guard = self.active_data.lock().unwrap();
         let data = Arc::clone(guard.as_ref().expect("solver not initialized for serving"));
         drop(guard);
@@ -334,13 +344,22 @@ impl MemoizedSolver {
             .map(std::num::NonZero::get)
             .unwrap_or(1)
             / 4;
-        // MTD(f) path benefits from more helpers warming the TT; pure Lazy
-        // SMP has diminishing returns (DashMap contention). Tune independently.
-        let n_extra = if words.len() <= 25_000 {
+        // Scale helpers by problem size to avoid DashMap contention livelock
+        // on small problems (see solve_position_smp comment for detail).
+        let n_extra = if words.len() < 500 {
+            0
+        } else if words.len() < 2_000 {
+            n_extra.clamp(0, 2)
+        } else if words.len() <= 25_000 {
             n_extra.clamp(1, 7)
         } else {
             n_extra.clamp(1, 2)
         };
+        // Debug/diagnostic override: HANGMAN_HELPERS=N.
+        let n_extra = std::env::var("HANGMAN_HELPERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(n_extra);
 
         let result = if words.len() <= 25_000 {
             // MTD(f) + Lazy SMP hybrid: all threads do iterative deepening
@@ -477,11 +496,27 @@ impl MemoizedSolver {
             .map(std::num::NonZero::get)
             .unwrap_or(1)
             / 4;
-        let n_extra = if n_words <= 25_000 {
+        // Scale Lazy SMP helpers by problem size. For small problems,
+        // helpers all converge on the same hot sub-problem TT shards and
+        // livelock in mutual DashMap contention (observed on 225-word k=4
+        // position that froze a 16-core DO droplet indefinitely). Solution:
+        // skip helpers entirely for small word sets — rayon YBWC on the main
+        // thread provides enough parallelism, and the reduced thread count
+        // keeps contention sublinear.
+        let n_extra = if n_words < 500 {
+            0
+        } else if n_words < 2_000 {
+            n_extra.clamp(0, 2)
+        } else if n_words <= 25_000 {
             n_extra.clamp(1, 7)
         } else {
             n_extra.clamp(1, 2)
         };
+        // Diagnostic override: HANGMAN_HELPERS=N.
+        let n_extra = std::env::var("HANGMAN_HELPERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(n_extra);
 
         let result = if n_words <= 25_000 {
             std::thread::scope(|s| {
@@ -615,11 +650,21 @@ impl MemoizedSolver {
             .map(std::num::NonZero::get)
             .unwrap_or(1)
             / 4;
-        let n_extra = if words.len() <= 25_000 {
+        // Scale helpers by problem size (see solve_position_smp for rationale).
+        let n_extra = if words.len() < 500 {
+            0
+        } else if words.len() < 2_000 {
+            n_extra.clamp(0, 2)
+        } else if words.len() <= 25_000 {
             n_extra.clamp(1, 7)
         } else {
             n_extra.clamp(1, 2)
         };
+        // Debug/diagnostic override: HANGMAN_HELPERS=N.
+        let n_extra = std::env::var("HANGMAN_HELPERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(n_extra);
 
         let result = std::thread::scope(|s| {
             // Launch SMP helper threads with the same budget.
@@ -1271,6 +1316,9 @@ impl MemoizedSolverInner {
         skip_required_scan: bool,
     ) -> u32 {
         if indices.len() <= 1 || max_depth == 0 {
+            return 0;
+        }
+        if self.data.cancelled.load(Ordering::Relaxed) {
             return 0;
         }
 

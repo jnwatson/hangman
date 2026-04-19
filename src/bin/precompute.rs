@@ -57,6 +57,11 @@ struct Cli {
     /// dict/length/depth, so modulo sharding produces non-overlapping slices.
     #[arg(long)]
     shard: Option<String>,
+
+    /// Debug: solve only this single position index and stop. Useful for
+    /// reproducing hangs on specific states.
+    #[arg(long)]
+    only_index: Option<usize>,
 }
 
 /// Parse a `--shard` argument of the form `"i/N"`. Returns `(i, N)`.
@@ -249,6 +254,19 @@ fn rss_gb() -> f64 {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Diagnostic: explicitly build rayon pool if RAYON_NUM_THREADS is set
+    // (the crate's automatic env-var handling is inconsistent in some envs).
+    if let Ok(s) = std::env::var("RAYON_NUM_THREADS")
+        && let Ok(n) = s.parse::<usize>()
+        && n >= 1
+    {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .ok();
+        eprintln!("rayon pool size: {}", rayon::current_num_threads());
+    }
+
     let (shard_i, shard_n) = match cli.shard.as_deref() {
         Some(s) => parse_shard(s)?,
         None => (0, 1),
@@ -286,6 +304,11 @@ fn main() -> Result<()> {
         let mut too_large = 0usize;
         let mut not_my_shard = 0usize;
         for (i, pos) in positions.iter().enumerate() {
+            if let Some(target) = cli.only_index {
+                if i != target {
+                    continue;
+                }
+            }
             if shard_n > 1 && i % shard_n != shard_i {
                 not_my_shard += 1;
                 continue;
