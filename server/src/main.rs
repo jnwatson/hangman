@@ -191,6 +191,15 @@ async fn handle_new_game(
 
     state.sessions.insert(game_id.clone(), session);
 
+    info!(
+        "GAME new id={} k={} dict={} minimax={:?} budget={}",
+        game_id,
+        params.length,
+        length_data.words.len(),
+        length_data.minimax_value,
+        guesses_allowed,
+    );
+
     Ok(Json(NewGameResponse {
         game_id,
         word_length: params.length,
@@ -204,16 +213,20 @@ async fn handle_guess(
     State(state): State<Arc<AppState>>,
     Json(req): Json<GuessRequest>,
 ) -> Result<Json<GuessResponse>, AppError> {
-    let mut session = state
-        .sessions
-        .get_mut(&req.game_id)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "game not found"))?;
+    // Snapshot session state into locals, then drop the DashMap guard
+    // immediately. Holding a DashMap RefMut across `.await` deadlocks the
+    // tokio runtime on a 1-worker setup, because the shard lock is sync.
+    let (word_length, current_remaining, current_masked) = {
+        let session = state
+            .sessions
+            .get(&req.game_id)
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, "game not found"))?;
 
-    session.last_active = std::time::Instant::now();
-
-    if session.game_over {
-        return Err(err(StatusCode::BAD_REQUEST, "game is over"));
-    }
+        if session.game_over {
+            return Err(err(StatusCode::BAD_REQUEST, "game is over"));
+        }
+        (session.word_length, session.remaining.clone(), session.masked)
+    };
 
     let letter = req
         .letter
@@ -226,24 +239,38 @@ async fn handle_guess(
         return Err(err(StatusCode::BAD_REQUEST, "invalid letter"));
     }
 
-    if session.masked & letter_bit(letter) != 0 {
+    if current_masked & letter_bit(letter) != 0 {
         return Err(err(StatusCode::BAD_REQUEST, "letter already guessed"));
     }
 
     let length_data = state
         .lengths
-        .get(&session.word_length)
+        .get(&word_length)
         .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "length data missing"))?;
+
+    // Look up the OPTIMAL letter for this pre-guess state from the cache.
+    // Used only for post-hoc analysis logging — if the user deviates from
+    // optimal play, we can trace which guesses were sub-optimal.
+    let optimal_letter: Option<u8> = {
+        let folded = fold_required_letters(&length_data.words, &current_remaining, current_masked);
+        let hash = canonical_hash_for_words(&length_data.words, &current_remaining, folded);
+        length_data
+            .disk_cache
+            .as_ref()
+            .and_then(|dc| dc.get(hash))
+            .and_then(decode_tt_entry)
+            .and_then(|e| e.best_letter)
+    };
 
     // Partition remaining words by this letter's positions.
     let mut partitions: HashMap<u32, Vec<usize>> = HashMap::new();
-    for &idx in &session.remaining {
+    for &idx in &current_remaining {
         let mask = pos_mask(&length_data.words[idx], letter);
         partitions.entry(mask).or_default().push(idx);
     }
 
     // Pick the worst partition for the guesser (highest minimax value).
-    let new_masked = session.masked | letter_bit(letter);
+    let new_masked = current_masked | letter_bit(letter);
 
     // Collect partitions into a stable Vec for indexed access.
     let parts: Vec<(u32, Vec<usize>)> = partitions.into_iter().collect();
@@ -298,11 +325,28 @@ async fn handle_guess(
                 *active = Some(Arc::clone(&length_data.solver));
             }
 
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            for &i in &unsolved {
+            // Sort unsolved partitions by size (smallest first) so quick wins
+            // happen before any slow position can starve the budget. Total
+            // budget must stay below nginx's 15s proxy_read_timeout, so we
+            // use 10s with a 4s per-partition cap.
+            let mut order: Vec<usize> = unsolved.clone();
+            order.sort_by_key(|&i| parts[i].1.len());
+
+            let total_deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(10);
+            for &i in &order {
+                let now = std::time::Instant::now();
+                if now >= total_deadline {
+                    any_timeout = true;
+                    continue;
+                }
+                // Per-partition cap of 4s, but never exceed total deadline.
+                let per_partition = std::time::Duration::from_secs(4);
+                let remaining = total_deadline.saturating_duration_since(now);
+                let dl = now + remaining.min(per_partition);
+
                 let solver = Arc::clone(&length_data.solver);
                 let indices = parts[i].1.clone();
-                let dl = deadline;
                 let result = tokio::task::spawn_blocking(move || {
                     let v = solver.solve_position_with_deadline(&indices, new_masked, Some(dl));
                     let cancelled = solver.was_cancelled();
@@ -356,7 +400,14 @@ async fn handle_guess(
         "solved" // all misses resolved within budget
     };
 
-    // Update session state.
+    // Re-acquire the session under a write guard to apply updates.
+    // No `.await` is held across this guard.
+    let mut session = state
+        .sessions
+        .get_mut(&req.game_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "game not found"))?;
+
+    session.last_active = std::time::Instant::now();
     session.masked = new_masked;
     session.remaining = best_indices.clone();
 
@@ -409,6 +460,57 @@ async fn handle_guess(
         .map(|&b| (b.to_ascii_uppercase() as char).to_string())
         .collect();
 
+    // Log this guess. Includes optimal letter (per solver) vs actual letter
+    // played, result of the guess, and state after.
+    let opt_ch = optimal_letter
+        .map(|b| (b as char).to_string())
+        .unwrap_or_else(|| "?".into());
+    let actual_ch = letter as char;
+    let result_str = if best_partition_mask == 0 {
+        "miss".to_string()
+    } else {
+        format!("hit({:#06x})", best_partition_mask)
+    };
+    let value_str = match values[best_idx] {
+        Some(v) => v.to_string(),
+        None => "?".into(),
+    };
+    info!(
+        "GAME guess id={} letter={} optimal={} result={} remaining={} wrong={} left={} value={} status={}",
+        req.game_id,
+        actual_ch,
+        opt_ch,
+        result_str,
+        session.remaining.len(),
+        session.wrong_letters.len(),
+        session.guesses_left,
+        value_str,
+        solve_status,
+    );
+
+    if session.game_over {
+        let guessed_letters: Vec<char> = (0..26u8)
+            .filter(|i| session.masked & (1u32 << i) != 0)
+            .map(|i| (b'a' + i) as char)
+            .collect();
+        let guessed_str: String = guessed_letters.iter().collect();
+        let wrong_str: String = session
+            .wrong_letters
+            .iter()
+            .map(|&b| b as char)
+            .collect();
+        info!(
+            "GAME end id={} won={} misses={} guessed=[{}] wrong=[{}] pattern={} word={:?}",
+            req.game_id,
+            session.won,
+            session.wrong_letters.len(),
+            guessed_str,
+            wrong_str,
+            pattern_str,
+            example_word.as_deref().unwrap_or("?"),
+        );
+    }
+
     Ok(Json(GuessResponse {
         positions,
         pattern: pattern_str,
@@ -426,22 +528,25 @@ async fn handle_hint(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HintQuery>,
 ) -> Result<Json<HintResponse>, AppError> {
-    let session = state
-        .sessions
-        .get(&params.game_id)
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "game not found"))?;
+    // Snapshot session state, then drop the DashMap guard before any
+    // `.await` to avoid deadlocking the tokio runtime on the sync shard lock.
+    let (word_length, masked, remaining) = {
+        let session = state
+            .sessions
+            .get(&params.game_id)
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, "game not found"))?;
 
-    if session.game_over {
-        return Err(err(StatusCode::BAD_REQUEST, "game is over"));
-    }
+        if session.game_over {
+            return Err(err(StatusCode::BAD_REQUEST, "game is over"));
+        }
+        (session.word_length, session.masked, session.remaining.clone())
+    };
 
     let length_data = state
         .lengths
-        .get(&session.word_length)
+        .get(&word_length)
         .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "length data missing"))?;
 
-    let masked = session.masked;
-    let remaining = session.remaining.clone();
     let solver = Arc::clone(&length_data.solver);
     let words = &length_data.words;
     let disk_cache = length_data.disk_cache.clone();
