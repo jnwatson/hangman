@@ -586,6 +586,12 @@ impl MemoizedSolver {
         // verification pass may fail to produce EXACT because TT bounds
         // from earlier iterations narrow the window (e.g., UPPER_BOUND
         // tightens beta so best == beta → LOWER_BOUND stored instead).
+        //
+        // Preserve whatever best_letter the prior solver cache_store wrote
+        // (under the same key, via dedup_and_hash). The force-store used to
+        // pass best_letter=0, which decoded as None and hid the optimal
+        // move in serving — making every server-side lookup of the root
+        // report `optimal=?` even when the solver had found the best move.
         {
             let folded = crate::solver::serving::fold_required_letters(
                 &data.words, &indices, masked,
@@ -593,7 +599,12 @@ impl MemoizedSolver {
             let root_key = crate::solver::serving::canonical_hash_for_words(
                 &data.words, &indices, folded,
             );
-            let packed = cache_pack(result, 0, BOUND_EXACT);
+            let prior_best_letter = data
+                .cache
+                .get(&root_key)
+                .and_then(|e| cache_unpack(*e).1)
+                .unwrap_or(0);
+            let packed = cache_pack(result, prior_best_letter, BOUND_EXACT);
             data.cache.insert(root_key, packed);
         }
 
@@ -922,7 +933,8 @@ impl MemoizedSolverInner {
     /// The answer is 0 if there exists an unmasked letter whose position
     /// masks differ between the two words AND both are non-zero (both hit,
     /// distinct partitions). Otherwise the answer is 1.
-    fn solve_two_words(&self, idx_a: usize, idx_b: usize, masked: LetterSet) -> u32 {
+    fn solve_two_words(&self, idx_a: usize, idx_b: usize, masked: LetterSet) -> (u32, u8) {
+        let mut any_useful_letter: u8 = 0;
         for letter_idx in 0..26u8 {
             let letter = b'a' + letter_idx;
             if masked & letter_bit(letter) != 0 {
@@ -932,10 +944,15 @@ impl MemoizedSolverInner {
             let mask_b = self.pos_mask_for(idx_b, letter);
             // Both non-zero and different → 2 distinct hit partitions, 0 misses.
             if mask_a != 0 && mask_b != 0 && mask_a != mask_b {
-                return 0;
+                return (0, letter);
+            }
+            // Track any letter present in at least one word as a fallback
+            // for when no 0-miss discriminator exists.
+            if any_useful_letter == 0 && (mask_a != 0 || mask_b != 0) {
+                any_useful_letter = letter;
             }
         }
-        1
+        (1, any_useful_letter)
     }
 
     /// Fast path for exactly 3 distinct words.
@@ -949,8 +966,9 @@ impl MemoizedSolverInner {
         idx_b: usize,
         idx_c: usize,
         masked: LetterSet,
-    ) -> u32 {
+    ) -> (u32, u8) {
         let mut best = u32::MAX;
+        let mut best_letter: u8 = 0;
         for li in 0..26u8 {
             let letter = b'a' + li;
             if masked & letter_bit(letter) != 0 {
@@ -970,16 +988,16 @@ impl MemoizedSolverInner {
 
             let worst = if ma == mb && mb == mc {
                 // All 3 same mask — letter doesn't discriminate.
-                u32::from(ma == 0) + self.solve_three_words(idx_a, idx_b, idx_c, new_masked)
+                u32::from(ma == 0) + self.solve_three_words(idx_a, idx_b, idx_c, new_masked).0
             } else if ma == mb {
                 // {a,b} together, {c} alone.
-                let val_ab = u32::from(ma == 0) + self.solve_two_words(idx_a, idx_b, new_masked);
+                let val_ab = u32::from(ma == 0) + self.solve_two_words(idx_a, idx_b, new_masked).0;
                 val_ab.max(u32::from(mc == 0))
             } else if ma == mc {
-                let val_ac = u32::from(ma == 0) + self.solve_two_words(idx_a, idx_c, new_masked);
+                let val_ac = u32::from(ma == 0) + self.solve_two_words(idx_a, idx_c, new_masked).0;
                 val_ac.max(u32::from(mb == 0))
             } else if mb == mc {
-                let val_bc = u32::from(mb == 0) + self.solve_two_words(idx_b, idx_c, new_masked);
+                let val_bc = u32::from(mb == 0) + self.solve_two_words(idx_b, idx_c, new_masked).0;
                 val_bc.max(u32::from(ma == 0))
             } else {
                 // All 3 distinct masks — each word in its own partition.
@@ -988,20 +1006,24 @@ impl MemoizedSolverInner {
                     .max(u32::from(mc == 0))
             };
 
-            best = best.min(worst);
-            if best == 0 {
-                return 0;
+            if worst < best {
+                best = worst;
+                best_letter = letter;
+                if best == 0 {
+                    return (0, best_letter);
+                }
             }
         }
-        best
+        (best, best_letter)
     }
 
     /// Fast path for exactly 4 distinct words.
     ///
     /// Directly evaluates all letters without the overhead of partition
     /// sorting, deduplication, or move ordering.
-    fn solve_four_words(&self, idxs: [usize; 4], masked: LetterSet) -> u32 {
+    fn solve_four_words(&self, idxs: [usize; 4], masked: LetterSet) -> (u32, u8) {
         let mut best = u32::MAX;
+        let mut best_letter: u8 = 0;
         for li in 0..26u8 {
             let letter = b'a' + li;
             if masked & letter_bit(letter) != 0 {
@@ -1021,12 +1043,15 @@ impl MemoizedSolverInner {
             // With 4 words, there are at most 4 distinct masks.
             let worst = self.evaluate_four_word_partitions(&idxs, &masks, new_masked);
 
-            best = best.min(worst);
-            if best == 0 {
-                return 0;
+            if worst < best {
+                best = worst;
+                best_letter = letter;
+                if best == 0 {
+                    return (0, best_letter);
+                }
             }
         }
-        best
+        (best, best_letter)
     }
 
     /// Helper: evaluate partitions formed by 4 words with given masks.
@@ -1066,10 +1091,13 @@ impl MemoizedSolverInner {
             let val = miss_cost
                 + match cnt {
                     1 => 0,
-                    2 => self.solve_two_words(group.1[0], group.1[1], masked),
-                    3 => self.solve_three_words(group.1[0], group.1[1], group.1[2], masked),
+                    2 => self.solve_two_words(group.1[0], group.1[1], masked).0,
+                    3 => self
+                        .solve_three_words(group.1[0], group.1[1], group.1[2], masked)
+                        .0,
                     4 => self
-                        .solve_four_words([group.1[0], group.1[1], group.1[2], group.1[3]], masked),
+                        .solve_four_words([group.1[0], group.1[1], group.1[2], group.1[3]], masked)
+                        .0,
                     _ => unreachable!(),
                 };
             worst = worst.max(val);
@@ -1497,29 +1525,29 @@ impl MemoizedSolverInner {
 
         // Fast path for exactly 2 words.
         if indices.len() == 2 {
-            let val = self.solve_two_words(indices[0], indices[1], masked);
+            let (val, bl) = self.solve_two_words(indices[0], indices[1], masked);
             self.data
                 .cache
-                .insert(cache_key, cache_pack(val, 0, BOUND_EXACT));
+                .insert(cache_key, cache_pack(val, bl, BOUND_EXACT));
             return val;
         }
 
         // Fast path for exactly 3 words — avoids partition/ordering overhead.
         if indices.len() == 3 {
-            let val = self.solve_three_words(indices[0], indices[1], indices[2], masked);
+            let (val, bl) = self.solve_three_words(indices[0], indices[1], indices[2], masked);
             self.data
                 .cache
-                .insert(cache_key, cache_pack(val, 0, BOUND_EXACT));
+                .insert(cache_key, cache_pack(val, bl, BOUND_EXACT));
             return val;
         }
 
         // Fast path for exactly 4 words.
         if indices.len() == 4 {
-            let val =
+            let (val, bl) =
                 self.solve_four_words([indices[0], indices[1], indices[2], indices[3]], masked);
             self.data
                 .cache
-                .insert(cache_key, cache_pack(val, 0, BOUND_EXACT));
+                .insert(cache_key, cache_pack(val, bl, BOUND_EXACT));
             return val;
         }
 
@@ -1768,7 +1796,7 @@ impl MemoizedSolverInner {
                 continue;
             }
             if subset.len() == 2 {
-                let val = miss_cost + self.solve_two_words(subset[0], subset[1], new_masked);
+                let val = miss_cost + self.solve_two_words(subset[0], subset[1], new_masked).0;
                 worst = worst.max(val);
                 established = true;
                 if worst >= cutoff {
