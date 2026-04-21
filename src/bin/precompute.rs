@@ -1,4 +1,5 @@
 #![deny(clippy::all, clippy::pedantic)]
+#![allow(clippy::similar_names)]
 
 //! Precompute the first N levels of the game tree for fast serving.
 //!
@@ -18,16 +19,28 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
+use rayon::prelude::*;
 use rustc_hash::{FxHashSet, FxHasher};
 
 use hangman2::dictionary::Dictionary;
 use hangman2::game::letter_bit;
 use hangman2::solver::serving::{canonical_hash_for_words, decode_tt_entry, fold_required_letters};
 use hangman2::solver::{DiskCache, MemoizedSolver};
+
+/// One position queued for solving by the worker pool. Owned copies of
+/// label + indices so it's Send and rayon-friendly.
+struct Task {
+    idx: usize,
+    label: String,
+    indices: Vec<usize>,
+    masked: u32,
+}
 
 #[derive(Parser)]
 #[command(
@@ -333,130 +346,159 @@ fn main() -> Result<()> {
             count_start.elapsed(),
         );
 
-        let mut solved = 0usize;
-        let mut skipped = 0usize;
-        let mut total_flushed = 0usize;
-        let mut too_large = 0usize;
-        let mut not_my_shard = 0usize;
+        let solved = AtomicUsize::new(0);
+        let skipped = AtomicUsize::new(0);
+        let total_flushed = AtomicUsize::new(0);
+        let too_large = AtomicUsize::new(0);
+        let not_my_shard = AtomicUsize::new(0);
+        let stdout_lock: Mutex<()> = Mutex::new(());
         let wall_start = Instant::now();
 
-        // Persistent solver for batched flushes. A single MemoizedSolver
-        // reuses the same `active_data` session across solves (per the
-        // solve_position_smp modification to match on words.len()), so the
-        // in-memory TT accumulates and we flush it to LMDB every N positions.
-        let session_solver = MemoizedSolver::with_disk_cache(Arc::clone(&dc));
-        let mut positions_since_flush: usize = 0;
         let flush_every = cli.flush_every_n_positions.max(1);
-        let flush_at_entries = cli.flush_at_cache_entries;
-        if flush_every > 1 || flush_at_entries > 0 {
-            println!(
-                "  batched flush: every {flush_every} positions{}",
-                if flush_at_entries > 0 {
-                    format!(" or {flush_at_entries} in-memory entries")
-                } else {
-                    String::new()
-                },
-            );
-        }
+        // Batch size trades enumeration-pause cost (small) against per-batch
+        // parallel throughput (large). 10K positions × ~400B label+indices
+        // ≈ 4 MB of transient memory per batch — negligible next to the
+        // dedup set. Most batches complete in seconds; enumeration resumes.
+        let batch_size: usize = 10_000;
+        let num_workers = rayon::current_num_threads().max(1);
+        println!(
+            "  worker pool: {num_workers} threads, batch size {batch_size}, flush every {flush_every} positions per worker"
+        );
 
-        let mut i: usize = 0;
+        let mut batch: Vec<Task> = Vec::with_capacity(batch_size);
+        let mut position_index: usize = 0;
+        let mut should_abort = false;
+
+        // Helper: drain the current batch through the worker pool.
+        let process_batch = |batch: &mut Vec<Task>| {
+            if batch.is_empty() {
+                return;
+            }
+            let chunk_size = batch.len().div_ceil(num_workers);
+            batch.par_chunks(chunk_size).for_each(|chunk| {
+                let solver = MemoizedSolver::with_disk_cache(Arc::clone(&dc));
+                let mut positions_since_flush = 0usize;
+                for task in chunk {
+                    if is_cached_exact(&dc, &words, &task.indices, task.masked) {
+                        skipped.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    let start = Instant::now();
+                    let value =
+                        solver.solve_position_smp(&words, &task.indices, task.masked);
+                    let elapsed = start.elapsed();
+                    solved.fetch_add(1, Ordering::Relaxed);
+                    positions_since_flush += 1;
+
+                    let flushed = if positions_since_flush >= flush_every {
+                        let n = match solver.flush_and_evict() {
+                            Some(Ok(n)) => n,
+                            Some(Err(e)) => {
+                                eprintln!("  WARNING: flush_and_evict failed: {e:#}");
+                                0
+                            }
+                            None => 0,
+                        };
+                        total_flushed.fetch_add(n, Ordering::Relaxed);
+                        positions_since_flush = 0;
+                        n
+                    } else {
+                        0
+                    };
+
+                    let pct = (task.idx + 1) as f64 / total as f64 * 100.0;
+                    let tid = rayon::current_thread_index().unwrap_or(0);
+                    {
+                        let _g = stdout_lock.lock().unwrap();
+                        if flushed > 0 || flush_every == 1 {
+                            println!(
+                                "  [{pct:>5.1}%] t{tid} {} => value={value}, {elapsed:.2?}, +{flushed} flushed (RSS {:.1}G)",
+                                task.label,
+                                rss_gb(),
+                            );
+                        } else {
+                            println!(
+                                "  [{pct:>5.1}%] t{tid} {} => value={value}, {elapsed:.2?} (flush in {})",
+                                task.label,
+                                flush_every - positions_since_flush,
+                            );
+                        }
+                    }
+                }
+                // Final flush for this chunk.
+                if positions_since_flush > 0
+                    && let Some(res) = solver.flush_and_evict()
+                {
+                    match res {
+                        Ok(n) => {
+                            total_flushed.fetch_add(n, Ordering::Relaxed);
+                        }
+                        Err(e) => eprintln!("  WARNING: per-chunk final flush failed: {e:#}"),
+                    }
+                }
+            });
+            batch.clear();
+        };
+
         for_each_position(&words, &all_indices, cli.depth, |label, indices, masked| {
-            let position_index = i;
-            i += 1;
+            let idx = position_index;
+            position_index += 1;
 
             if let Some(target) = cli.only_index
-                && position_index != target
+                && idx != target
             {
                 return true;
             }
-            if shard_n > 1 && position_index % shard_n != shard_i {
-                not_my_shard += 1;
+            if shard_n > 1 && idx % shard_n != shard_i {
+                not_my_shard.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
             if let Some(max) = cli.max_words
                 && indices.len() > max
             {
-                too_large += 1;
+                too_large.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
-            if is_cached_exact(&dc, &words, indices, masked) {
-                skipped += 1;
-                return cli.only_index != Some(position_index);
+
+            batch.push(Task {
+                idx,
+                label: label.to_string(),
+                indices: indices.to_vec(),
+                masked,
+            });
+
+            if batch.len() >= batch_size {
+                process_batch(&mut batch);
             }
 
-            let start = Instant::now();
-            let value = session_solver.solve_position_smp(&words, indices, masked);
-            let elapsed = start.elapsed();
-            solved += 1;
-            positions_since_flush += 1;
-
-            let should_flush = positions_since_flush >= flush_every
-                || (flush_at_entries > 0 && session_solver.session_cache_len() >= flush_at_entries);
-            let flushed = if should_flush {
-                let n = match session_solver.flush_and_evict() {
-                    Some(Ok(n)) => n,
-                    Some(Err(e)) => {
-                        eprintln!("  WARNING: flush_and_evict failed: {e:#}");
-                        0
-                    }
-                    None => 0,
-                };
-                total_flushed += n;
-                positions_since_flush = 0;
-                n
-            } else {
-                0
-            };
-
-            let pct = (position_index + 1) as f64 / total as f64 * 100.0;
-            if should_flush || flush_every == 1 {
-                println!(
-                    "  [{:>5.1}%] {} => value={}, {:.2?}, +{} flushed (RSS {:.1}G, session={})",
-                    pct,
-                    label,
-                    value,
-                    elapsed,
-                    flushed,
-                    rss_gb(),
-                    session_solver.session_cache_len(),
-                );
-            } else {
-                println!(
-                    "  [{:>5.1}%] {} => value={}, {:.2?}, session={} (flush in {})",
-                    pct,
-                    label,
-                    value,
-                    elapsed,
-                    session_solver.session_cache_len(),
-                    flush_every - positions_since_flush,
-                );
+            if cli.only_index == Some(idx) {
+                should_abort = true;
+                return false;
             }
-
-            // Abort the walk after solving the --only-index target.
-            cli.only_index != Some(position_index)
+            true
         });
 
-        // Final flush of any remaining in-memory entries.
-        if positions_since_flush > 0
-            && let Some(res) = session_solver.flush_and_evict()
-        {
-            match res {
-                Ok(n) => {
-                    total_flushed += n;
-                    println!("  final flush: +{n} entries");
-                }
-                Err(e) => eprintln!("  WARNING: final flush failed: {e:#}"),
-            }
+        // Final batch.
+        if !batch.is_empty() {
+            process_batch(&mut batch);
         }
+        let _ = should_abort;
 
         let wall = wall_start.elapsed();
         let shard_note = if shard_n > 1 {
-            format!(", {not_my_shard} skipped (other shard)")
+            format!(
+                ", {} skipped (other shard)",
+                not_my_shard.load(Ordering::Relaxed)
+            )
         } else {
             String::new()
         };
         println!(
-            "  Done: {solved} solved, {skipped} cached, {too_large} skipped (too large){shard_note}, {total_flushed} entries flushed, {wall:.1?} total",
+            "  Done: {} solved, {} cached, {} skipped (too large){shard_note}, {} entries flushed, {wall:.1?} total",
+            solved.load(Ordering::Relaxed),
+            skipped.load(Ordering::Relaxed),
+            too_large.load(Ordering::Relaxed),
+            total_flushed.load(Ordering::Relaxed),
         );
         println!("  Disk cache now: {} entries\n", dc.entry_count());
     }
