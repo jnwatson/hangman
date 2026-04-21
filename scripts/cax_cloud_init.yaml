@@ -1,0 +1,23 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+packages:
+  - build-essential
+  - curl
+  - git
+  - rsync
+  - pkg-config
+  - libssl-dev
+  - tmux
+  - htop
+write_files:
+  - path: /root/install_rust.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -eu
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --no-modify-path
+      echo 'source $HOME/.cargo/env' >> /root/.bashrc
+      touch /root/rust_ready
+runcmd:
+  - bash /root/install_rust.sh
