@@ -8,7 +8,7 @@ Solver for **Schrödinger's Hangman** (aka adversarial/evil hangman). This is a 
 - **Referee** responds with either a miss or reveals all positions of that letter in the word — but the referee has no fixed word in mind. They may "imagine" any word consistent with prior reveals and misses.
 - Both players agree on a dictionary and word length upfront.
 
-**Goal:** Find optimal strategies for both players (minimax) and compute the minimum number of misses for each word length.
+**Goal:** Prove we have a **strong solution** to adversarial hangman — i.e., compute minimax-optimal play from every reachable position, for every supported word length, and persist those results so any position can be answered on demand. Finding the root minimax miss count per length is a byproduct; the deliverable is a complete strategy, not just the numbers.
 
 ## Tech Stack
 

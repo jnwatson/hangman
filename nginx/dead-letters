@@ -28,7 +28,7 @@ server {
 
         proxy_connect_timeout 5s;
         proxy_send_timeout 5s;
-        proxy_read_timeout 15s;
+        proxy_read_timeout 35s;
     }
 }
 
@@ -55,7 +55,7 @@ server {
 
         proxy_connect_timeout 5s;
         proxy_send_timeout 5s;
-        proxy_read_timeout 15s;
+        proxy_read_timeout 35s;
     }
 
     listen [::]:443 ssl ipv6only=on; # managed by Certbot

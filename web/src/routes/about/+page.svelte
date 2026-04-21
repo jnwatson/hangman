@@ -36,8 +36,8 @@
 				</thead>
 				<tbody>
 					<tr><td>3</td><td>972</td><td>18</td></tr>
-					<tr><td>4</td><td>3,903</td><td>17</td></tr>
-					<tr><td>5</td><td>8,636</td><td>16</td></tr>
+					<tr><td>4</td><td>3,903</td><td>15</td></tr>
+					<tr><td>5</td><td>8,636</td><td>14</td></tr>
 					<tr><td>6</td><td>15,232</td><td>13</td></tr>
 					<tr><td>7</td><td>23,109</td><td>12</td></tr>
 					<tr><td>8</td><td>28,420</td><td>9</td></tr>
@@ -70,6 +70,7 @@
 			<li><strong>Transposition table</strong> &mdash; canonical hashing identifies equivalent positions across different guess orderings</li>
 			<li><strong>History heuristic</strong> &mdash; letters that have been empirically good are tried first</li>
 			<li><strong>Miss-chain lower bounds</strong> &mdash; quickly proves positions require more misses than the current bound</li>
+			<li><strong>Dead-column collapse</strong> &mdash; when a letter has been guessed but appears nowhere in the remaining words, its position is dead across every row. The canonicalizer strips those empty columns before hashing, so positions that differ only in how many dead letters have been tried collapse to the same cache entry, dramatically raising hit rates late in a game.</li>
 			<li><strong>Disk cache</strong> &mdash; LMDB-backed persistent cache means positions are solved once and reused</li>
 		</ul>
 	</section>

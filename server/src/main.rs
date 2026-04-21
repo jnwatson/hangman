@@ -314,7 +314,7 @@ async fn handle_guess(
 
         // Wait for the semaphore (cancelled solver finishes within ms).
         let permit = tokio::time::timeout(
-            std::time::Duration::from_secs(6),
+            std::time::Duration::from_secs(12),
             state.solver_semaphore.acquire(),
         ).await;
 
@@ -327,21 +327,21 @@ async fn handle_guess(
 
             // Sort unsolved partitions by size (smallest first) so quick wins
             // happen before any slow position can starve the budget. Total
-            // budget must stay below nginx's 15s proxy_read_timeout, so we
-            // use 10s with a 4s per-partition cap.
+            // budget must stay below nginx's proxy_read_timeout (currently
+            // 25s); we use 20s with an 8s per-partition cap.
             let mut order: Vec<usize> = unsolved.clone();
             order.sort_by_key(|&i| parts[i].1.len());
 
             let total_deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(10);
+                std::time::Instant::now() + std::time::Duration::from_secs(20);
             for &i in &order {
                 let now = std::time::Instant::now();
                 if now >= total_deadline {
                     any_timeout = true;
                     continue;
                 }
-                // Per-partition cap of 4s, but never exceed total deadline.
-                let per_partition = std::time::Duration::from_secs(4);
+                // Per-partition cap of 8s, but never exceed total deadline.
+                let per_partition = std::time::Duration::from_secs(8);
                 let remaining = total_deadline.saturating_duration_since(now);
                 let dl = now + remaining.min(per_partition);
 
@@ -815,13 +815,19 @@ fn encode_bitvec(indices: &[usize], total_words: usize) -> String {
 }
 
 /// Rough minimax estimates for word lengths without precomputed data.
+/// Fallback minimax when the root entry isn't in the disk cache.
+///
+/// Values below are from cache probing (min-over-letters of max-over-partitions)
+/// where available, otherwise from earlier heuristic estimates. Precompute now
+/// writes the depth-0 root entry, so new cache dumps will make this fallback
+/// obsolete for the k values that have been re-precomputed.
 fn estimate_minimax(k: usize, _word_count: usize) -> u32 {
     match k {
         1 => 25,
-        2 => 14,
-        3 => 17,
-        4 => 16,
-        5 => 14,
+        2 => 14,  // verified via cache probe
+        3 => 17,  // verified via cache probe
+        4 => 14,  // verified via cache probe (was 16)
+        5 => 13,  // verified via cache probe (was 14)
         6 => 12,
         7 => 11,
         8 => 8,
@@ -831,8 +837,11 @@ fn estimate_minimax(k: usize, _word_count: usize) -> u32 {
         12 => 4,
         13 => 4,
         14 => 3,
-        15..=19 => 2,
-        20..=25 => 1,
+        15..=17 => 2,
+        18 => 3,  // verified via cache probe (was 2)
+        19 => 3,  // verified via cache probe (was 2)
+        20 => 2,  // verified via cache probe (was 1)
+        21..=25 => 1,
         _ => 0,
     }
 }
