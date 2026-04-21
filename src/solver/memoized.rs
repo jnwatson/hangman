@@ -186,10 +186,25 @@ impl MemoizedSolver {
     pub fn flush_and_evict(&self) -> Option<anyhow::Result<usize>> {
         let dc = self.disk_cache.as_ref()?;
         let guard = self.active_data.lock().unwrap();
-        let data = guard.as_ref()?;
-        let result = dc.save(&data.cache);
-        data.cache.clear();
+        if let Some(data) = guard.as_ref() {
+            let result = dc.save(&data.cache);
+            data.cache.clear();
+            return Some(result);
+        }
+        drop(guard);
+        // solve_position_smp clears active_data on exit; merged entries live
+        // in self.cache. Flush those and clear to bound memory in batched mode.
+        let result = dc.save(&self.cache);
+        self.cache.clear();
         Some(result)
+    }
+
+    /// Number of in-memory TT entries in the active session (if any).
+    /// Used to decide when to flush during batched precompute.
+    #[must_use]
+    pub fn session_cache_len(&self) -> usize {
+        let guard = self.active_data.lock().unwrap();
+        guard.as_ref().map_or(0, |d| d.cache.len())
     }
 
     /// Create a solver pre-initialized with word data for serving.
@@ -487,8 +502,24 @@ impl MemoizedSolver {
         if indices.is_empty() {
             return 0;
         }
-        let data = Arc::new(SolverData::new(words.to_vec(), self.disk_cache.clone()));
-        *self.active_data.lock().unwrap() = Some(Arc::clone(&data));
+        // Reuse existing SolverData if its word list matches — this lets callers
+        // accumulate the TT across multiple solve_position_smp calls (the
+        // precompute batched-flush path). Otherwise create a fresh session.
+        // Word-count match is a proxy for identical dictionary within a single
+        // length; callers must not mix dictionaries within one session.
+        let data = {
+            let mut guard = self.active_data.lock().unwrap();
+            match guard.as_ref() {
+                Some(existing) if existing.words.len() == words.len() => {
+                    Arc::clone(existing)
+                }
+                _ => {
+                    let d = Arc::new(SolverData::new(words.to_vec(), self.disk_cache.clone()));
+                    *guard = Some(Arc::clone(&d));
+                    d
+                }
+            }
+        };
         let indices: Vec<usize> = indices.to_vec();
 
         let n_words = indices.len();
