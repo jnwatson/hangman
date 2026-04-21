@@ -37,6 +37,18 @@ path = "src/bin/tt_coverage.rs"
 name = "merge-caches"
 path = "src/bin/merge_caches.rs"
 
+[[bin]]
+name = "cache-probe"
+path = "src/bin/cache_probe.rs"
+
+[[bin]]
+name = "depth-coverage-eval"
+path = "src/bin/depth_coverage_eval.rs"
+
+[[bin]]
+name = "trace-sim"
+path = "src/bin/trace_sim.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1
