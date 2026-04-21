@@ -1,10 +1,16 @@
+// Every public method on MemoizedSolver locks `active_data` via
+// `lock().unwrap()`; clippy flags each for a missing `# Panics` section.
+// Documenting "panics if the mutex is poisoned" eight times adds noise
+// without informing the reader, so allow the lint module-wide.
+#![allow(clippy::missing_panics_doc)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use super::canon::{dedup_and_hash, dedup_only};
 use super::disk_cache::DiskCache;
@@ -148,7 +154,7 @@ impl MemoizedSolver {
 
     /// Copy all entries from another solver's persistent cache into this one.
     pub fn copy_cache_from(&self, other: &MemoizedSolver) {
-        for entry in other.cache.iter() {
+        for entry in &other.cache {
             self.cache.insert(*entry.key(), *entry.value());
         }
     }
@@ -253,14 +259,14 @@ impl MemoizedSolver {
             return 0;
         }
         // If the deadline has already passed, mark as cancelled and return.
-        if let Some(dl) = deadline {
-            if Instant::now() >= dl {
-                let guard = self.active_data.lock().unwrap();
-                if let Some(data) = guard.as_ref() {
-                    data.cancelled.store(true, Ordering::Relaxed);
-                }
-                return u32::MAX;
+        if let Some(dl) = deadline
+            && Instant::now() >= dl
+        {
+            let guard = self.active_data.lock().unwrap();
+            if let Some(data) = guard.as_ref() {
+                data.cancelled.store(true, Ordering::Relaxed);
             }
+            return u32::MAX;
         }
         let guard = self.active_data.lock().unwrap();
         let data = Arc::clone(guard.as_ref().expect("solver not initialized for serving"));
@@ -293,7 +299,7 @@ impl MemoizedSolver {
     #[must_use]
     pub fn was_cancelled(&self) -> bool {
         let guard = self.active_data.lock().unwrap();
-        guard.as_ref().map_or(false, |d| d.cancelled.load(Ordering::Relaxed))
+        guard.as_ref().is_some_and(|d| d.cancelled.load(Ordering::Relaxed))
     }
 
     /// Cancel the currently running solve (if any). The solver will notice
@@ -349,6 +355,7 @@ impl MemoizedSolver {
     ///
     /// Panics if words is empty.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn solve(&self, words: &[Vec<u8>]) -> u32 {
         assert!(!words.is_empty());
         let data = Arc::new(SolverData::new(words.to_vec(), self.disk_cache.clone()));
@@ -493,6 +500,7 @@ impl MemoizedSolver {
     ///
     /// `words` must be the full dictionary for this length (not a subset) so
     /// that TT entries are keyed identically to the server's lookup path.
+    #[allow(clippy::too_many_lines)]
     pub fn solve_position_smp(
         &self,
         words: &[Vec<u8>],
@@ -1786,7 +1794,7 @@ impl MemoizedSolverInner {
         // of sorting (O(n log n)). Each partition is a (pos_mask, Vec<idx>).
         // Pre-size to avoid rehashing — at most word_length+1 distinct masks.
         let mut partitions: FxHashMap<u32, Vec<usize>> =
-            FxHashMap::with_capacity_and_hasher(32, Default::default());
+            FxHashMap::with_capacity_and_hasher(32, FxBuildHasher);
         for &idx in indices {
             let mask = self.pos_mask_for(idx, letter);
             partitions.entry(mask).or_default().push(idx);
@@ -1944,7 +1952,7 @@ impl MemoizedSolverInner {
                 partitions.entry(mask).or_default().push(idx);
             }
 
-            for (_, subset) in &partitions {
+            for subset in partitions.values() {
                 if subset.len() > 1 {
                     self.warm_recursive(subset, new_masked, solved, visited);
                 }
@@ -2097,8 +2105,8 @@ mod tests {
     /// can look up via `fold_required_letters` + `canonical_hash_for_words`.
     ///
     /// Regression test: MTD(f)'s verification pass had its window narrowed by
-    /// UPPER_BOUND TT entries from earlier iterations, causing the root entry
-    /// to be stored as LOWER_BOUND instead of EXACT. The server's
+    /// `UPPER_BOUND` TT entries from earlier iterations, causing the root entry
+    /// to be stored as `LOWER_BOUND` instead of `EXACT`. The server's
     /// `decode_tt_entry` filters non-EXACT entries, causing cache misses.
     #[test]
     fn solve_position_smp_stores_exact_entries() {
@@ -2131,7 +2139,7 @@ mod tests {
 
         let solver = MemoizedSolver::new();
 
-        for (_pmask, indices) in &partitions {
+        for indices in partitions.values() {
             if indices.len() <= 1 {
                 continue;
             }
@@ -2140,7 +2148,7 @@ mod tests {
 
         // Verify: every non-trivial partition has an EXACT entry in the
         // solver's cache, retrievable via the server's lookup path.
-        for (_pmask, indices) in &partitions {
+        for indices in partitions.values() {
             if indices.len() <= 1 {
                 continue;
             }

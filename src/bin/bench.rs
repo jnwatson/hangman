@@ -1,4 +1,9 @@
 #![deny(clippy::all, clippy::pedantic)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::items_after_statements,
+    clippy::doc_markdown,
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

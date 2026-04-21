@@ -257,6 +257,7 @@ where
     true
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn rss_gb() -> f64 {
     let rss = std::fs::read_to_string("/proc/self/statm")
         .ok()
@@ -266,6 +267,7 @@ fn rss_gb() -> f64 {
     rss as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -435,15 +437,15 @@ fn main() -> Result<()> {
         });
 
         // Final flush of any remaining in-memory entries.
-        if positions_since_flush > 0 {
-            if let Some(res) = session_solver.flush_and_evict() {
-                match res {
-                    Ok(n) => {
-                        total_flushed += n;
-                        println!("  final flush: +{n} entries");
-                    }
-                    Err(e) => eprintln!("  WARNING: final flush failed: {e:#}"),
+        if positions_since_flush > 0
+            && let Some(res) = session_solver.flush_and_evict()
+        {
+            match res {
+                Ok(n) => {
+                    total_flushed += n;
+                    println!("  final flush: +{n} entries");
                 }
+                Err(e) => eprintln!("  WARNING: final flush failed: {e:#}"),
             }
         }
 

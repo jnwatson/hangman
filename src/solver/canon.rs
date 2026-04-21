@@ -36,6 +36,7 @@ pub(super) fn canonicalize(sigs: &[Vec<u8>]) -> Vec<Vec<u8>> {
 /// Uses a fast heuristic canonicalization for performance.
 /// This may produce slightly more cache entries than exact canonicalization
 /// (missing some position isomorphisms) but is much faster.
+#[allow(dead_code)]
 pub(super) fn canonical_hash(sigs: &[Vec<u8>]) -> u128 {
     if sigs.is_empty() {
         return 0;
@@ -81,7 +82,7 @@ pub(super) fn dedup_and_hash(
 
 /// Dedup only: collapse identical effective signatures without computing
 /// the canonical hash. Used when the canonical key is already known from
-/// the key_cache but the TT missed.
+/// the `key_cache` but the TT missed.
 pub(super) fn dedup_only(
     words: &[Vec<u8>],
     indices: &[usize],
@@ -300,6 +301,7 @@ fn dedup_and_hash_general(
 }
 
 /// Canonicalize with column merging + column permutation + letter relabeling.
+#[allow(dead_code)]
 fn canonical_hash_fast(sigs: &[Vec<u8>], k: usize) -> u128 {
     let n = sigs.len();
     let total = n * k;

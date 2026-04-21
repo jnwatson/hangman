@@ -1,4 +1,11 @@
 #![deny(clippy::all, clippy::pedantic)]
+#![allow(
+    clippy::collapsible_if,
+    clippy::doc_markdown,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cloned_ref_to_slice_refs,
+)]
 
 //! Merge multiple LMDB cache directories into a single destination.
 //!

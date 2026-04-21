@@ -93,7 +93,7 @@ pub fn decode_tt_entry(packed: u32) -> Option<TtEntry> {
     })
 }
 
-/// Decode a packed TT entry into (value, best_letter, bound) without filtering.
+/// Decode a packed TT entry into (value, `best_letter`, bound) without filtering.
 #[must_use]
 pub fn decode_tt_entry_raw(packed: u32) -> (u32, Option<u8>, u32) {
     super::memoized::cache_unpack(packed)

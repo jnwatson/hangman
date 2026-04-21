@@ -1,4 +1,12 @@
 #![deny(clippy::all, clippy::pedantic)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::manual_div_ceil,
+    clippy::uninlined_format_args,
+    clippy::doc_markdown,
+    clippy::for_kv_map,
+)]
 //! Measure TT coverage: after a root solve, what fraction of game-tree
 //! positions at each depth are already in the transposition table?
 //!
