@@ -360,9 +360,16 @@ fn main() -> Result<()> {
         // ≈ 4 MB of transient memory per batch — negligible next to the
         // dedup set. Most batches complete in seconds; enumeration resumes.
         let batch_size: usize = 10_000;
+        // Chunk size matters for load balance. When chunks are batch/N (one
+        // per worker), a single slow position in any chunk stalls its whole
+        // worker while others finish early and idle. Smaller chunks give
+        // rayon work-stealing granularity. At chunk_size=64, a 10K batch
+        // produces ~156 chunks for 16 workers (~10 chunks per worker) — the
+        // unluckiest worker's pain is bounded to one chunk's worth.
+        let chunk_size: usize = 64;
         let num_workers = rayon::current_num_threads().max(1);
         println!(
-            "  worker pool: {num_workers} threads, batch size {batch_size}, flush every {flush_every} positions per worker"
+            "  worker pool: {num_workers} threads, batch size {batch_size}, chunk size {chunk_size}, flush every {flush_every} positions per worker"
         );
 
         let mut batch: Vec<Task> = Vec::with_capacity(batch_size);
@@ -374,7 +381,6 @@ fn main() -> Result<()> {
             if batch.is_empty() {
                 return;
             }
-            let chunk_size = batch.len().div_ceil(num_workers);
             batch.par_chunks(chunk_size).for_each(|chunk| {
                 let solver = MemoizedSolver::with_disk_cache(Arc::clone(&dc));
                 let mut positions_since_flush = 0usize;
