@@ -1,12 +1,45 @@
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use saferlmdb as lmdb;
 
 use super::memoized::{BOUND_EXACT, BOUND_LOWER, BOUND_UPPER, cache_unpack};
+
+/// Cumulative outcomes of all `DiskCache::save` calls on a single `DiskCache`.
+///
+/// The `rejected_by_exact` counter is the diagnostic of interest for parallel
+/// precompute: each increment means a worker computed a bound for a position
+/// that another worker had already EXACT-resolved and flushed. That worker's
+/// compute for that subtree was redundant — counts that climb fast indicate
+/// the parallel layout is wasting significant CPU on overlapping solves.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SaveStats {
+    /// New entries written (no prior disk entry for this key).
+    pub inserted: u64,
+    /// Existing entries overwritten because the new value dominated.
+    pub overwritten: u64,
+    /// Writes rejected because the existing entry was EXACT.
+    pub rejected_by_exact: u64,
+    /// Writes rejected because the existing bound was already tighter or of
+    /// a different bound type (can't overwrite LOWER with UPPER, etc.).
+    pub rejected_other: u64,
+}
+
+impl SaveStats {
+    #[must_use]
+    pub fn total_written(self) -> u64 {
+        self.inserted + self.overwritten
+    }
+
+    #[must_use]
+    pub fn total_considered(self) -> u64 {
+        self.inserted + self.overwritten + self.rejected_by_exact + self.rejected_other
+    }
+}
 
 /// Decide whether a new packed entry should overwrite an existing packed entry
 /// in the disk cache. Mirrors the in-memory dominance rules in
@@ -49,6 +82,12 @@ pub struct DiskCache {
     // Arc lets Database hold a 'static reference to the Environment.
     env: Arc<lmdb::Environment>,
     db: lmdb::Database<'static>,
+    /// Cumulative `save()` stats across all calls, updated atomically so
+    /// parallel workers can contribute without locking.
+    stat_inserted: AtomicU64,
+    stat_overwritten: AtomicU64,
+    stat_rejected_exact: AtomicU64,
+    stat_rejected_other: AtomicU64,
 }
 
 impl DiskCache {
@@ -95,7 +134,25 @@ impl DiskCache {
         )
         .context("opening LMDB database")?;
 
-        Ok(Self { env, db })
+        Ok(Self {
+            env,
+            db,
+            stat_inserted: AtomicU64::new(0),
+            stat_overwritten: AtomicU64::new(0),
+            stat_rejected_exact: AtomicU64::new(0),
+            stat_rejected_other: AtomicU64::new(0),
+        })
+    }
+
+    /// Snapshot of cumulative `save()` stats. Safe to call concurrently.
+    #[must_use]
+    pub fn save_stats(&self) -> SaveStats {
+        SaveStats {
+            inserted: self.stat_inserted.load(Ordering::Relaxed),
+            overwritten: self.stat_overwritten.load(Ordering::Relaxed),
+            rejected_by_exact: self.stat_rejected_exact.load(Ordering::Relaxed),
+            rejected_other: self.stat_rejected_other.load(Ordering::Relaxed),
+        }
     }
 
     /// Open an existing disk cache, returning `None` if the directory doesn't
@@ -138,7 +195,10 @@ impl DiskCache {
     /// Returns an error if a write transaction cannot be created or committed.
     pub fn save(&self, cache: &DashMap<u128, u32>) -> Result<usize> {
         const BATCH_SIZE: usize = 100_000;
-        let mut written = 0usize;
+        let mut inserted = 0u64;
+        let mut overwritten = 0u64;
+        let mut rejected_exact = 0u64;
+        let mut rejected_other = 0u64;
         let entries: Vec<(u128, u32)> = cache
             .iter()
             .map(|entry| (*entry.key(), *entry.value()))
@@ -165,26 +225,51 @@ impl DiskCache {
                                 None
                             }
                         });
-                    let should_write = match existing {
-                        None => true,
-                        Some(old) => new_dominates(value, old),
-                    };
-                    if should_write {
-                        access
-                            .put(
-                                &self.db,
-                                &key_bytes[..],
-                                &val_bytes[..],
-                                &lmdb::put::Flags::empty(),
-                            )
-                            .context("putting entry")?;
-                        written += 1;
+                    match existing {
+                        None => {
+                            access
+                                .put(
+                                    &self.db,
+                                    &key_bytes[..],
+                                    &val_bytes[..],
+                                    &lmdb::put::Flags::empty(),
+                                )
+                                .context("putting entry")?;
+                            inserted += 1;
+                        }
+                        Some(old) => {
+                            if new_dominates(value, old) {
+                                access
+                                    .put(
+                                        &self.db,
+                                        &key_bytes[..],
+                                        &val_bytes[..],
+                                        &lmdb::put::Flags::empty(),
+                                    )
+                                    .context("putting entry")?;
+                                overwritten += 1;
+                            } else {
+                                let (_, _, old_bound) = cache_unpack(old);
+                                if old_bound == BOUND_EXACT {
+                                    rejected_exact += 1;
+                                } else {
+                                    rejected_other += 1;
+                                }
+                            }
+                        }
                     }
                 }
             }
             txn.commit().context("committing batch")?;
         }
-        Ok(written)
+        self.stat_inserted.fetch_add(inserted, Ordering::Relaxed);
+        self.stat_overwritten.fetch_add(overwritten, Ordering::Relaxed);
+        self.stat_rejected_exact
+            .fetch_add(rejected_exact, Ordering::Relaxed);
+        self.stat_rejected_other
+            .fetch_add(rejected_other, Ordering::Relaxed);
+        #[allow(clippy::cast_possible_truncation)]
+        Ok((inserted + overwritten) as usize)
     }
 
     /// Look up a canonical key. Returns the packed u32 value.

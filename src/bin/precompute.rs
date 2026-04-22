@@ -506,6 +506,28 @@ fn main() -> Result<()> {
             too_large.load(Ordering::Relaxed),
             total_flushed.load(Ordering::Relaxed),
         );
+        // Save-path stats: rejected_by_exact counts bounds that hit an
+        // existing EXACT on disk — each one means the solve that produced
+        // the bound was redundant work another worker had already done.
+        // High rates indicate the parallel layout should share more state.
+        let stats = dc.save_stats();
+        let considered = stats.total_considered();
+        if considered > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            let rejected_by_exact_pct = stats.rejected_by_exact as f64 / considered as f64 * 100.0;
+            #[allow(clippy::cast_precision_loss)]
+            let rejected_other_pct = stats.rejected_other as f64 / considered as f64 * 100.0;
+            println!(
+                "  Save stats: {} considered, {} inserted, {} overwritten, {} rejected-by-exact ({:.1}%), {} rejected-other ({:.1}%)",
+                considered,
+                stats.inserted,
+                stats.overwritten,
+                stats.rejected_by_exact,
+                rejected_by_exact_pct,
+                stats.rejected_other,
+                rejected_other_pct,
+            );
+        }
         println!("  Disk cache now: {} entries\n", dc.entry_count());
     }
 
