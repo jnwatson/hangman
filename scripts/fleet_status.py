@@ -246,9 +246,9 @@ def main():
             print(line)
             continue
         state, note = classify(p)
-        rss = f"{p['rss_gb']:.1f}G" if p["rss_gb"] > 0.05 else ""
-        prog = f"{p['pct']}%" if p["pct"] else ""
-        age = fmt_age(now - p["log_mtime"]) if p["log_mtime"] else ""
+        rss = f"{p.get('rss_gb', 0):.1f}G" if p.get("rss_gb", 0) > 0.05 else ""
+        prog = f"{p.get('pct', '')}%" if p.get("pct") else ""
+        age = fmt_age(now - p["log_mtime"]) if p.get("log_mtime") else ""
         cost = fmt_cost(m)
         try:
             total_cost += float(cost.lstrip("$"))

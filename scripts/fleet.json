@@ -1,17 +1,18 @@
 [
   {
-    "id": "local-k4-d4",
-    "job": "k=4 depth=4",
+    "id": "local-k4-chain",
+    "job": "k=4 chained d=5..12 (pc)",
     "provider": "local",
     "host_type": "ryzen-7950X3D",
     "ip": null,
     "user": null,
     "cost_per_hr_usd": 0.0,
-    "started_at": "2026-04-21T20:23:00-04:00",
-    "log_path": "/tmp/precompute_local_k4d4.log",
+    "started_at": "2026-04-22T05:42:09-04:00",
+    "log_path": "/tmp/precompute_local_k4d5.log",
+    "log_glob": "/tmp/precompute_local_k4d*.log",
     "probe": "local",
     "tmux_session": "pc",
-    "pid_match": "--lengths 4 --cache-dir game_cache --depth 4"
+    "pid_match": "--lengths 4 --cache-dir game_cache"
   },
   {
     "id": "local-k3-chain",
@@ -72,22 +73,23 @@
     "pid_match": "--lengths 7 --cache-dir game_cache --depth 4"
   },
   {
-    "id": "cax41-k7-k8-d5",
-    "job": "k=8 depth=5 (co-located)",
+    "id": "cax41-k7-k8-chain",
+    "job": "k=8 chained d=5..7 (pc2)",
     "provider": "hetzner",
     "host_type": "cax41",
     "ip": "178.104.236.230",
     "user": "root",
     "cost_per_hr_usd": 0.0,
     "started_at": "2026-04-22T00:50:00-04:00",
-    "log_path": "/root/precompute_k8_d5.log",
+    "log_path": "/root/precompute_k8_d6.log",
     "probe": "ssh",
     "tmux_session": "pc2",
-    "pid_match": "--lengths 8 --cache-dir game_cache --depth 5"
+    "pid_match": "--lengths 8 --cache-dir game_cache",
+    "log_glob": "/root/precompute_k8_d*.log"
   },
   {
-    "id": "hc4-k5-d4",
-    "job": "k=5 depth=4",
+    "id": "hc4-k5-chain",
+    "job": "k=5 chained d=4..11 (pc)",
     "provider": "servarica",
     "host_type": "v2-kvm-slim-16",
     "ip": "38.49.208.110",
@@ -95,10 +97,11 @@
     "cost_per_hr_usd": 0.058,
     "held_through": "2026-05-20",
     "started_at": "2026-04-22T03:20:42-04:00",
-    "log_path": "/root/precompute.log",
+    "log_path": "/root/precompute_k5_d5.log",
     "probe": "ssh",
     "tmux_session": "pc",
-    "pid_match": "--lengths 5 --cache-dir game_cache --depth 4"
+    "pid_match": "--lengths 5 --cache-dir game_cache",
+    "log_glob": "/root/precompute_k5_d*.log"
   },
   {
     "id": "hc4-k10-d6",
