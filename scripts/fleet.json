@@ -23,15 +23,15 @@
     "user": null,
     "cost_per_hr_usd": 0.0,
     "started_at": "2026-04-22T00:38:00-04:00",
-    "log_path": "/tmp/precompute_local_k3d6.log",
+    "log_path": "/tmp/precompute_local_k3d9.log",
     "log_glob": "/tmp/precompute_local_k3d*.log",
     "probe": "local",
     "tmux_session": "pc2",
     "pid_match": "--lengths 3 --cache-dir game_cache"
   },
   {
-    "id": "cax41-k6-d4",
-    "job": "k=6 depth=4",
+    "id": "cax41-k6-chain",
+    "job": "k=6 chained d=5..10 (pc)",
     "provider": "hetzner",
     "host_type": "cax41",
     "ip": "178.104.233.192",
@@ -39,9 +39,10 @@
     "cost_per_hr_usd": 0.047,
     "started_at": "2026-04-21T20:23:00-04:00",
     "log_path": "/root/precompute.log",
+    "log_glob": "/root/precompute_k6_d*.log",
     "probe": "ssh",
     "tmux_session": "pc",
-    "pid_match": "--lengths 6 --cache-dir game_cache --depth 4"
+    "pid_match": "--lengths 6 --cache-dir game_cache"
   },
   {
     "id": "cax41-k6-k9-chain",
@@ -52,29 +53,30 @@
     "user": "root",
     "cost_per_hr_usd": 0.0,
     "started_at": "2026-04-22T00:34:00-04:00",
-    "log_path": "/root/precompute_k9_d5.log",
+    "log_path": "/root/precompute_k9_d6.log",
     "log_glob": "/root/precompute_k9_d*.log",
     "probe": "ssh",
     "tmux_session": "pc2",
     "pid_match": "--lengths 9 --cache-dir game_cache"
   },
   {
-    "id": "cax41-k7-d4",
-    "job": "k=7 depth=4",
+    "id": "cax41-k7-chain",
+    "job": "k=7 d=5 (flush=1000 exp) then chain d=6..9 (pc)",
     "provider": "hetzner",
     "host_type": "cax41",
     "ip": "178.104.236.230",
     "user": "root",
     "cost_per_hr_usd": 0.047,
-    "started_at": "2026-04-21T20:23:00-04:00",
-    "log_path": "/root/precompute.log",
+    "started_at": "2026-04-22T04:17:00-04:00",
+    "log_path": "/root/precompute_k7_d5.log",
+    "log_glob": "/root/precompute_k7_d*.log",
     "probe": "ssh",
     "tmux_session": "pc",
-    "pid_match": "--lengths 7 --cache-dir game_cache --depth 4"
+    "pid_match": "--lengths 7 --cache-dir game_cache"
   },
   {
     "id": "cax41-k7-k8-chain",
-    "job": "k=8 chained d=5..7 (pc2)",
+    "job": "k=8 chained d=5..7 (pc2, SUSPENDED)",
     "provider": "hetzner",
     "host_type": "cax41",
     "ip": "178.104.236.230",
@@ -82,10 +84,10 @@
     "cost_per_hr_usd": 0.0,
     "started_at": "2026-04-22T00:50:00-04:00",
     "log_path": "/root/precompute_k8_d6.log",
+    "log_glob": "/root/precompute_k8_d*.log",
     "probe": "ssh",
     "tmux_session": "pc2",
-    "pid_match": "--lengths 8 --cache-dir game_cache",
-    "log_glob": "/root/precompute_k8_d*.log"
+    "pid_match": "--lengths 8 --cache-dir game_cache"
   },
   {
     "id": "hc4-k5-chain",
@@ -98,14 +100,14 @@
     "held_through": "2026-05-20",
     "started_at": "2026-04-22T03:20:42-04:00",
     "log_path": "/root/precompute_k5_d5.log",
+    "log_glob": "/root/precompute_k5_d*.log",
     "probe": "ssh",
     "tmux_session": "pc",
-    "pid_match": "--lengths 5 --cache-dir game_cache",
-    "log_glob": "/root/precompute_k5_d*.log"
+    "pid_match": "--lengths 5 --cache-dir game_cache"
   },
   {
     "id": "hc4-k10-d6",
-    "job": "k=10 depth=6 (auto-chained after d=5)",
+    "job": "k=10 d=6 (DONE — target reached, pc2 idle)",
     "provider": "servarica",
     "host_type": "v2-kvm-slim-16",
     "ip": "38.49.208.110",
