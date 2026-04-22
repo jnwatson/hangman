@@ -14,18 +14,18 @@
     "pid_match": "--lengths 4 --cache-dir game_cache --depth 4"
   },
   {
-    "id": "local-k3-d4",
-    "job": "k=3 depth=4 (co-located)",
+    "id": "local-k3-d5",
+    "job": "k=3 depth=5",
     "provider": "local",
     "host_type": "ryzen-7950X3D",
     "ip": null,
     "user": null,
     "cost_per_hr_usd": 0.0,
-    "started_at": "2026-04-21T22:13:43-04:00",
-    "log_path": "/tmp/precompute_local_k3d4.log",
+    "started_at": "2026-04-22T00:38:00-04:00",
+    "log_path": "/tmp/precompute_local_k3d5.log",
     "probe": "local",
     "tmux_session": "pc2",
-    "pid_match": "--lengths 3 --cache-dir game_cache --depth 4"
+    "pid_match": "--lengths 3 --cache-dir game_cache --depth 5"
   },
   {
     "id": "cax41-k6-d4",
@@ -111,19 +111,5 @@
     "probe": "ssh",
     "tmux_session": "pc2",
     "pid_match": "--lengths 10 --cache-dir game_cache --depth 5"
-  },
-  {
-    "id": "hc4-k4-d5",
-    "job": "k=4 depth=5 (3rd slot)",
-    "provider": "servarica",
-    "host_type": "v2-kvm-slim-16",
-    "ip": "38.49.208.110",
-    "user": "root",
-    "cost_per_hr_usd": 0.0,
-    "started_at": "2026-04-22T04:15:20-04:00",
-    "log_path": "/root/precompute_k4_d5.log",
-    "probe": "ssh",
-    "tmux_session": "pc3",
-    "pid_match": "--lengths 4 --cache-dir game_cache --depth 5"
   }
 ]
