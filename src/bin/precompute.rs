@@ -475,6 +475,26 @@ fn main() -> Result<()> {
 
             if batch.len() >= batch_size {
                 process_batch(&mut batch);
+                // After each batch drain, print a rolling save-stats
+                // summary so we can gauge worker redundancy without
+                // waiting for the whole k run to finish. rejected-by-exact
+                // is the diagnostic of interest.
+                let stats = dc.save_stats();
+                let considered = stats.total_considered();
+                if considered > 0 {
+                    #[allow(clippy::cast_precision_loss)]
+                    let rbe_pct =
+                        stats.rejected_by_exact as f64 / considered as f64 * 100.0;
+                    println!(
+                        "  [stats] considered={} inserted={} overwritten={} rej-exact={} ({:.2}%) rej-other={}",
+                        considered,
+                        stats.inserted,
+                        stats.overwritten,
+                        stats.rejected_by_exact,
+                        rbe_pct,
+                        stats.rejected_other,
+                    );
+                }
             }
 
             if cli.only_index == Some(idx) {
