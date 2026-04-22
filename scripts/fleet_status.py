@@ -25,9 +25,10 @@ SSH_OPTS = [
     "-o", "BatchMode=yes",
 ]
 
-PROBE_SH = r"""
+PROBE_SH_TMPL = r"""
 set -u
-LOG=/root/precompute.log
+LOG="__LOG__"
+PID_MATCH="__PID_MATCH__"
 if [ -f "$LOG" ]; then
     MTIME=$(stat -c %Y "$LOG")
     SIZE=$(stat -c %s "$LOG")
@@ -37,7 +38,16 @@ if [ -f "$LOG" ]; then
 else
     MTIME=0; SIZE=0; LAST=""; PCT=""; FINISHED=0
 fi
-PID=$(pgrep -x precompute | head -1)
+# Find the precompute child (not the /usr/bin/time -v wrapper) whose
+# cmdline includes PID_MATCH. pgrep -x matches exact binary name, then we
+# verify the specific k+depth args on each candidate.
+PID=""
+for pid in $(pgrep -x precompute); do
+    if tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | grep -qF -- "$PID_MATCH"; then
+        PID=$pid
+        break
+    fi
+done
 if [ -n "$PID" ]; then
     RSS=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
     THR=$(ps -o nlwp= -p "$PID" 2>/dev/null | tr -d ' ')
@@ -57,12 +67,18 @@ echo "LAST=$LAST"
 """
 
 
+def _build_probe(log, pid_match):
+    return PROBE_SH_TMPL.replace("__LOG__", log).replace("__PID_MATCH__", pid_match)
+
+
 def probe_ssh(m):
     ip = m["ip"]
     user = m.get("user", "root")
+    log = m.get("log_path", "/root/precompute.log")
+    pid_match = m.get("pid_match", "")
     try:
         r = subprocess.run(
-            ["ssh", *SSH_OPTS, f"{user}@{ip}", PROBE_SH],
+            ["ssh", *SSH_OPTS, f"{user}@{ip}", _build_probe(log, pid_match)],
             capture_output=True, text=True, timeout=25,
         )
         if r.returncode != 0:
@@ -76,6 +92,7 @@ def probe_ssh(m):
 
 def probe_local(m):
     log = Path(m["log_path"])
+    pid_match = m.get("pid_match", "")
     d = {"PID": "", "RSS_KB": "0", "THREADS": "0", "CPU": "0",
          "MTIME": "0", "LOG_SIZE": "0", "PCT": "", "FINISHED": "0", "LAST": ""}
     if log.exists():
@@ -89,23 +106,28 @@ def probe_local(m):
         if pct_matches:
             d["PCT"] = pct_matches[-1]
         d["FINISHED"] = str(len(re.findall(r"s total$|^Done: ", text, re.MULTILINE)))
-    # Find local precompute PID
+    # Find the specific precompute PID matching pid_match (via cmdline).
     try:
+        pattern = f"target/release/precompute.*{pid_match}" if pid_match else "target/release/precompute"
         r = subprocess.run(
-            ["pgrep", "-x", "precompute"],
+            ["pgrep", "-f", pattern],
             capture_output=True, text=True, timeout=3,
         )
         pids = r.stdout.split()
         if pids:
-            pid = pids[0]
-            d["PID"] = pid
-            ps = subprocess.run(
-                ["ps", "-o", "rss=,nlwp=,%cpu=", "-p", pid],
-                capture_output=True, text=True, timeout=3,
-            )
-            parts = ps.stdout.split()
-            if len(parts) >= 3:
-                d["RSS_KB"], d["THREADS"], d["CPU"] = parts[0], parts[1], parts[2]
+            # Filter out the /usr/bin/time -v wrapper — keep just the precompute binary.
+            for pid in pids:
+                cmd_path = Path(f"/proc/{pid}/comm")
+                if cmd_path.exists() and cmd_path.read_text().strip() == "precompute":
+                    d["PID"] = pid
+                    ps = subprocess.run(
+                        ["ps", "-o", "rss=,nlwp=,%cpu=", "-p", pid],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    parts = ps.stdout.split()
+                    if len(parts) >= 3:
+                        d["RSS_KB"], d["THREADS"], d["CPU"] = parts[0], parts[1], parts[2]
+                    break
     except Exception:
         pass
     return _parse_probe_dict(d)
@@ -187,7 +209,7 @@ def main():
         results = {mid: (f.result() if f else {"pending": True}) for mid, f in futures.items()}
 
     print(f"fleet_status @ {datetime.datetime.now().strftime('%H:%M:%S')}")
-    hdr = f"{'ID':<24} {'STATE':<7} {'PROG':>6} {'RSS':>6} {'LOG-AGE':>8} {'COST':>7}  NOTE / LAST LINE"
+    hdr = f"{'ID':<32} {'STATE':<7} {'PROG':>6} {'RSS':>6} {'LOG-AGE':>8} {'COST':>7}  NOTE / LAST LINE"
     print(hdr)
     print("-" * len(hdr))
 
@@ -195,7 +217,7 @@ def main():
     for m in fleet:
         p = results[m["id"]]
         if p.get("pending"):
-            line = f"{m['id']:<24} {'WAIT':<7} {'':>6} {'':>6} {'':>8} {'$0':>7}  {m['job']}"
+            line = f"{m['id']:<32} {'WAIT':<7} {'':>6} {'':>6} {'':>8} {'$0':>7}  {m['job']}"
             print(line)
             continue
         state, note = classify(p)
@@ -209,7 +231,7 @@ def main():
             pass
         # note takes priority if something is wrong, else show last log line
         tail = p.get("last", "")[:60] if state in ("RUN", "DONE") else note
-        print(f"{m['id']:<24} {state:<7} {prog:>6} {rss:>6} {age:>8} {cost:>7}  {tail}")
+        print(f"{m['id']:<32} {state:<7} {prog:>6} {rss:>6} {age:>8} {cost:>7}  {tail}")
 
     print("-" * len(hdr))
     print(f"total accumulated cost: ${total_cost:.2f}")
