@@ -28,7 +28,13 @@ SSH_OPTS = [
 PROBE_SH_TMPL = r"""
 set -u
 LOG="__LOG__"
+LOG_GLOB="__LOG_GLOB__"
 PID_MATCH="__PID_MATCH__"
+# If LOG_GLOB is set, pick the most recently modified matching file.
+if [ -n "$LOG_GLOB" ]; then
+    LATEST=$(ls -1t $LOG_GLOB 2>/dev/null | head -1)
+    [ -n "$LATEST" ] && LOG=$LATEST
+fi
 if [ -f "$LOG" ]; then
     MTIME=$(stat -c %Y "$LOG")
     SIZE=$(stat -c %s "$LOG")
@@ -67,18 +73,22 @@ echo "LAST=$LAST"
 """
 
 
-def _build_probe(log, pid_match):
-    return PROBE_SH_TMPL.replace("__LOG__", log).replace("__PID_MATCH__", pid_match)
+def _build_probe(log, log_glob, pid_match):
+    return (PROBE_SH_TMPL
+            .replace("__LOG__", log)
+            .replace("__LOG_GLOB__", log_glob)
+            .replace("__PID_MATCH__", pid_match))
 
 
 def probe_ssh(m):
     ip = m["ip"]
     user = m.get("user", "root")
     log = m.get("log_path", "/root/precompute.log")
+    log_glob = m.get("log_glob", "")
     pid_match = m.get("pid_match", "")
     try:
         r = subprocess.run(
-            ["ssh", *SSH_OPTS, f"{user}@{ip}", _build_probe(log, pid_match)],
+            ["ssh", *SSH_OPTS, f"{user}@{ip}", _build_probe(log, log_glob, pid_match)],
             capture_output=True, text=True, timeout=25,
         )
         if r.returncode != 0:
@@ -90,8 +100,23 @@ def probe_ssh(m):
         return {"error": str(e)[:80]}
 
 
+def _resolve_log_path(m):
+    """For chained jobs, log_path is a template that may refer to a single
+    old depth's file. If `log_glob` is set, pick the most recently modified
+    file matching that glob — which tracks whichever depth the chain is
+    currently writing to.
+    """
+    glob_pat = m.get("log_glob")
+    if glob_pat:
+        import glob
+        matches = sorted(glob.glob(glob_pat), key=lambda p: Path(p).stat().st_mtime if Path(p).exists() else 0)
+        if matches:
+            return Path(matches[-1])
+    return Path(m["log_path"])
+
+
 def probe_local(m):
-    log = Path(m["log_path"])
+    log = _resolve_log_path(m)
     pid_match = m.get("pid_match", "")
     d = {"PID": "", "RSS_KB": "0", "THREADS": "0", "CPU": "0",
          "MTIME": "0", "LOG_SIZE": "0", "PCT": "", "FINISHED": "0", "LAST": ""}
