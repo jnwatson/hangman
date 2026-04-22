@@ -101,12 +101,12 @@ const PAR_THRESHOLD: usize = 50;
 const VALUE_MASK: u32 = 0x1F;
 const LETTER_SHIFT: u32 = 5;
 const BOUND_SHIFT: u32 = 10;
-const BOUND_EXACT: u32 = 0;
-const BOUND_LOWER: u32 = 1;
-const BOUND_UPPER: u32 = 2;
+pub(super) const BOUND_EXACT: u32 = 0;
+pub(super) const BOUND_LOWER: u32 = 1;
+pub(super) const BOUND_UPPER: u32 = 2;
 
 #[inline]
-fn cache_pack(value: u32, best_letter: u8, bound: u32) -> u32 {
+pub(super) fn cache_pack(value: u32, best_letter: u8, bound: u32) -> u32 {
     let letter_idx = u32::from(best_letter.wrapping_sub(b'a'));
     let letter_bits = if letter_idx < 26 { letter_idx } else { 31 };
     (value & VALUE_MASK) | (letter_bits << LETTER_SHIFT) | (bound << BOUND_SHIFT)

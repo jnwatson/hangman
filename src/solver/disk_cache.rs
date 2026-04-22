@@ -6,6 +6,40 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use saferlmdb as lmdb;
 
+use super::memoized::{BOUND_EXACT, BOUND_LOWER, BOUND_UPPER, cache_unpack};
+
+/// Decide whether a new packed entry should overwrite an existing packed entry
+/// in the disk cache. Mirrors the in-memory dominance rules in
+/// `MemoizedSolverInner::cache_store`:
+/// - EXACT always overwrites non-EXACT; EXACT is never overwritten by a bound.
+/// - A tighter bound of the *same* type wins (LOWER with larger value,
+///   UPPER with smaller value).
+/// - A bound of one type never overwrites a bound of the other type.
+///
+/// This prevents a parallel worker's bound entry from clobbering an EXACT
+/// that was written by another worker earlier in the same run.
+#[inline]
+fn new_dominates(new_packed: u32, old_packed: u32) -> bool {
+    if new_packed == old_packed {
+        return false;
+    }
+    let (new_val, _, new_bound) = cache_unpack(new_packed);
+    let (old_val, _, old_bound) = cache_unpack(old_packed);
+    if old_bound == BOUND_EXACT {
+        return false;
+    }
+    if new_bound == BOUND_EXACT {
+        return true;
+    }
+    if new_bound == BOUND_LOWER && old_bound == BOUND_LOWER && new_val > old_val {
+        return true;
+    }
+    if new_bound == BOUND_UPPER && old_bound == BOUND_UPPER && new_val < old_val {
+        return true;
+    }
+    false
+}
+
 /// On-disk transposition table backed by LMDB.
 ///
 /// Stores `(u128 canonical_key → u32 packed_value)` entries in a memory-mapped
@@ -84,20 +118,27 @@ impl DiskCache {
         Self::open(dir, word_length, words, map_size).map(Some)
     }
 
-    /// Write all entries (EXACT, LOWER, UPPER) from an in-memory cache to LMDB.
+    /// Write all entries (EXACT, LOWER, UPPER) from an in-memory cache to LMDB
+    /// with dominance-aware overwrite semantics.
     ///
     /// When an entry already exists on disk, the new value wins if it is:
-    /// - EXACT (always overwrites), or
-    /// - a tighter bound of the same type.
+    /// - EXACT and the old isn't EXACT, or
+    /// - a tighter bound of the *same* type (tighter LOWER has larger value;
+    ///   tighter UPPER has smaller value).
     ///
-    /// Returns the number of entries written.
+    /// Otherwise the old entry is preserved. This is critical in parallel
+    /// precompute: without dominance, two workers writing the same canonical
+    /// key can clobber an EXACT entry with a bound, hiding optimal moves from
+    /// the serving path (which filters to EXACT-only lookups).
+    ///
+    /// Returns the number of entries actually written (new or dominating).
     ///
     /// # Errors
     ///
     /// Returns an error if a write transaction cannot be created or committed.
     pub fn save(&self, cache: &DashMap<u128, u32>) -> Result<usize> {
         const BATCH_SIZE: usize = 100_000;
-        let mut count = 0usize;
+        let mut written = 0usize;
         let entries: Vec<(u128, u32)> = cache
             .iter()
             .map(|entry| (*entry.key(), *entry.value()))
@@ -111,20 +152,39 @@ impl DiskCache {
                 for &(key, value) in chunk {
                     let key_bytes = key.to_le_bytes();
                     let val_bytes = value.to_le_bytes();
-                    access
-                        .put(
-                            &self.db,
-                            &key_bytes[..],
-                            &val_bytes[..],
-                            &lmdb::put::Flags::empty(),
-                        )
-                        .context("putting entry")?;
+                    // Read existing entry in the same transaction. If it
+                    // exists and dominates (or equals) the new value, skip
+                    // the write.
+                    let existing = access
+                        .get::<[u8], [u8]>(&self.db, &key_bytes[..])
+                        .ok()
+                        .and_then(|b| {
+                            if b.len() >= 4 {
+                                Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                            } else {
+                                None
+                            }
+                        });
+                    let should_write = match existing {
+                        None => true,
+                        Some(old) => new_dominates(value, old),
+                    };
+                    if should_write {
+                        access
+                            .put(
+                                &self.db,
+                                &key_bytes[..],
+                                &val_bytes[..],
+                                &lmdb::put::Flags::empty(),
+                            )
+                            .context("putting entry")?;
+                        written += 1;
+                    }
                 }
             }
             txn.commit().context("committing batch")?;
-            count += chunk.len();
         }
-        Ok(count)
+        Ok(written)
     }
 
     /// Look up a canonical key. Returns the packed u32 value.
@@ -207,6 +267,75 @@ mod tests {
         let words = test_words();
         let result = DiskCache::open_if_exists(dir.path(), 3, &words, 10 * 1024 * 1024).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn save_preserves_existing_exact_against_later_bound() {
+        use super::super::memoized::cache_pack;
+        let dir = TempDir::new().unwrap();
+        let words = test_words();
+        let dc = DiskCache::open(dir.path(), 3, &words, 10 * 1024 * 1024).unwrap();
+
+        // First write: EXACT value=5 for key 42.
+        let first: DashMap<u128, u32> = DashMap::new();
+        first.insert(42, cache_pack(5, b'a', BOUND_EXACT));
+        assert_eq!(dc.save(&first).unwrap(), 1);
+
+        // Second write: UPPER bound value=7 for same key — simulates a
+        // parallel worker computing a looser bound for a position an earlier
+        // worker already EXACT-resolved. Must NOT overwrite.
+        let second: DashMap<u128, u32> = DashMap::new();
+        second.insert(42, cache_pack(7, b'a', BOUND_UPPER));
+        let written = dc.save(&second).unwrap();
+        assert_eq!(written, 0, "EXACT must not be overwritten by a bound");
+
+        let got = dc.get(42).unwrap();
+        let (val, _, bound) = cache_unpack(got);
+        assert_eq!(bound, BOUND_EXACT);
+        assert_eq!(val, 5);
+    }
+
+    #[test]
+    fn save_overwrites_bound_with_tighter_same_type() {
+        use super::super::memoized::cache_pack;
+        let dir = TempDir::new().unwrap();
+        let words = test_words();
+        let dc = DiskCache::open(dir.path(), 3, &words, 10 * 1024 * 1024).unwrap();
+
+        // First: UPPER value=10 (value ≤ 10).
+        let first: DashMap<u128, u32> = DashMap::new();
+        first.insert(42, cache_pack(10, b'a', BOUND_UPPER));
+        dc.save(&first).unwrap();
+
+        // Second: UPPER value=7 (tighter upper bound; dominates).
+        let second: DashMap<u128, u32> = DashMap::new();
+        second.insert(42, cache_pack(7, b'a', BOUND_UPPER));
+        let written = dc.save(&second).unwrap();
+        assert_eq!(written, 1);
+        let (val, _, bound) = cache_unpack(dc.get(42).unwrap());
+        assert_eq!((val, bound), (7, BOUND_UPPER));
+
+        // Third: UPPER value=12 (looser; should not overwrite).
+        let third: DashMap<u128, u32> = DashMap::new();
+        third.insert(42, cache_pack(12, b'a', BOUND_UPPER));
+        let written = dc.save(&third).unwrap();
+        assert_eq!(written, 0);
+        let (val, _, _) = cache_unpack(dc.get(42).unwrap());
+        assert_eq!(val, 7, "looser upper bound must not overwrite tighter");
+
+        // Fourth: LOWER value=3 — different bound type, should not overwrite.
+        let fourth: DashMap<u128, u32> = DashMap::new();
+        fourth.insert(42, cache_pack(3, b'a', BOUND_LOWER));
+        let written = dc.save(&fourth).unwrap();
+        assert_eq!(written, 0);
+
+        // Fifth: EXACT value=5 — always wins over bound.
+        let fifth: DashMap<u128, u32> = DashMap::new();
+        fifth.insert(42, cache_pack(5, b'a', BOUND_EXACT));
+        let written = dc.save(&fifth).unwrap();
+        assert_eq!(written, 1);
+        let (val, _, bound) = cache_unpack(dc.get(42).unwrap());
+        assert_eq!((val, bound), (5, BOUND_EXACT));
     }
 
     #[test]
