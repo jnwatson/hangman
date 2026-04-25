@@ -132,8 +132,8 @@
 					<span class="thinking-dot"></span>
 					<span class="thinking-dot"></span>
 					<span class="thinking-dot"></span>
-					{#if game.queuePosition && game.queuePosition > 1}
-						<span class="queue-position">Queue position {game.queuePosition}</span>
+					{#if game.queuePosition && game.queuePosition > 7}
+						<span class="queue-position">Queue position {game.queuePosition - 7}</span>
 					{/if}
 				</div>
 			{:else if game.state.solveStatus === 'degraded'}
