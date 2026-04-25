@@ -234,8 +234,8 @@ fn main() -> Result<()> {
         } else {
             let deadline = Instant::now() + Duration::from_secs(cli.deadline_secs);
             let t0 = Instant::now();
-            let _ = solver.solve_position_with_deadline(indices, masked, Some(deadline));
-            let cancelled = solver.was_cancelled();
+            let (_, cancelled) =
+                solver.solve_position_with_deadline(indices, masked, Some(deadline));
             let elapsed_ms = t0.elapsed().as_millis() as u64;
 
             if cancelled || elapsed_ms >= timeout_ms.saturating_sub(200) {

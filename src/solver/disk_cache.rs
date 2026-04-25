@@ -121,8 +121,13 @@ impl DiskCache {
             let path_str = db_dir
                 .to_str()
                 .with_context(|| format!("non-UTF8 path: {}", db_dir.display()))?;
+            // NORDAHEAD: disable OS readahead on the mmap. Helps random-access
+            // performance when the DB is larger than RAM (common for us) and
+            // especially when multiple concurrent LMDB envs compete for page
+            // cache — readahead wastes RAM on speculative pages that get
+            // evicted before being used.
             builder
-                .open(path_str, &lmdb::open::Flags::empty(), 0o644)
+                .open(path_str, &lmdb::open::Flags::NORDAHEAD, 0o644)
                 .with_context(|| format!("opening LMDB env at {}", db_dir.display()))?
         };
         let env = Arc::new(env);

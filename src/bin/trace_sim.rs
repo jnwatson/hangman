@@ -35,7 +35,7 @@ use hangman2::dictionary::Dictionary;
 use hangman2::game::letter_bit;
 use hangman2::solver::disk_cache::DiskCache;
 use hangman2::solver::MemoizedSolver;
-use hangman2::solver::serving::{canonical_hash_for_words, fold_required_letters, pos_mask};
+use hangman2::solver::serving::{canonical_hash_for_words, decode_tt_entry, fold_required_letters, pos_mask};
 
 #[derive(Parser)]
 struct Cli {
@@ -132,10 +132,11 @@ fn simulate_turn(
         }
         let folded = fold_required_letters(words, indices, new_masked);
         let hash = canonical_hash_for_words(words, indices, folded);
-        if let Some(packed) = dc.get(hash) {
-            // value is bits 0..4 of packed entry
-            let val = packed & 0x1F;
-            values.push(Some(val));
+        // Match server: only EXACT bounds count as cache hits for serving.
+        // LOWER/UPPER bound entries trigger live-solve just like misses.
+        let cached = dc.get(hash).and_then(decode_tt_entry).map(|e| e.value);
+        if let Some(v) = cached {
+            values.push(Some(v));
         } else {
             values.push(None);
             unsolved.push(i);
@@ -155,41 +156,35 @@ fn simulate_turn(
             let per_cap = Duration::from_secs(per_partition_secs);
             let remaining = total_deadline.saturating_duration_since(now);
             let dl = now + remaining.min(per_cap);
-            let v = solver.solve_position_with_deadline(&parts_vec[i].1, new_masked, Some(dl));
-            if !solver.was_cancelled() {
+            let (v, cancelled) =
+                solver.solve_position_with_deadline(&parts_vec[i].1, new_masked, Some(dl));
+            if !cancelled {
                 values[i] = Some(v);
             }
-            // If cancelled, values[i] stays None — worst-case picker will skip it.
+            // If cancelled, values[i] stays None — unsolved partition, treated as
+            // u32::MAX by the picker below (matching server).
         }
     }
 
-    // Phase 3: pick worst partition (referee-optimal). Unsolved → treated as
-    // worst (unbounded), so they lose to any solved partition. Match server.
-    let mut best_idx: Option<usize> = None;
+    // Phase 3: pick worst partition (referee-optimal). Match server exactly:
+    // unsolved partitions count as u32::MAX, so the referee force-prefers them
+    // over any solved partition. Ties broken by larger partition size.
+    let mut best_idx = 0usize;
     let mut best_val: u32 = 0;
-    for (i, (pmask, _indices)) in parts_vec.iter().enumerate() {
-        if let Some(v) = values[i] {
-            let miss_cost = u32::from(*pmask == 0);
-            let total_val = miss_cost + v;
-            if best_idx.is_none() || total_val > best_val {
-                best_idx = Some(i);
-                best_val = total_val;
-            }
+    for (i, (pmask, indices)) in parts_vec.iter().enumerate() {
+        let miss_cost = u32::from(*pmask == 0);
+        let value = match values[i] {
+            Some(v) => miss_cost + v,
+            None => u32::MAX,
+        };
+        if value > best_val || (value == best_val && indices.len() > parts_vec[best_idx].1.len()) {
+            best_val = value;
+            best_idx = i;
         }
-    }
-    // Fallback: if all missed (shouldn't happen for small indices), pick biggest.
-    if best_idx.is_none() {
-        let (i, _) = parts_vec
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, p)| p.1.len())
-            .expect("empty partitions");
-        best_idx = Some(i);
     }
 
     let turn_ms = t0.elapsed().as_millis() as u64;
-    let idx = best_idx.unwrap();
-    let (_pmask, indices) = parts_vec.swap_remove(idx);
+    let (_pmask, indices) = parts_vec.swap_remove(best_idx);
     // The guessed letter is always added to `masked` — it has been claimed
     // whether the referee answered miss (0) or hit (pmask != 0).
     (turn_ms, indices, new_masked, best_val)

@@ -132,6 +132,9 @@
 					<span class="thinking-dot"></span>
 					<span class="thinking-dot"></span>
 					<span class="thinking-dot"></span>
+					{#if game.queuePosition && game.queuePosition > 1}
+						<span class="queue-position">Queue position {game.queuePosition}</span>
+					{/if}
 				</div>
 			{:else if game.state.solveStatus === 'degraded'}
 				<div class="solve-status degraded">Degraded — some positions uncached</div>

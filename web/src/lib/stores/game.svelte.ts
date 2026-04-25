@@ -163,7 +163,17 @@ export function createGameState() {
 				body: JSON.stringify({ game_id: state.gameId, letter }),
 			});
 			if (!res.ok) throw new Error(await res.text());
-			const data = await res.json();
+
+			let data: any;
+			if (res.status === 202) {
+				// Slow path: server queued the work. Poll until done.
+				const queued = await res.json();
+				queuePosition = queued.queue_position ?? null;
+				data = await pollGuessStatus(queued.request_id);
+			} else {
+				queuePosition = null;
+				data = await res.json();
+			}
 
 			state.guessedLetters = new Set([...state.guessedLetters, letter]);
 
@@ -198,7 +208,33 @@ export function createGameState() {
 			error = e instanceof Error ? e.message : 'Failed to submit guess';
 		} finally {
 			loading = false;
+			queuePosition = null;
 		}
+	}
+
+	let queuePosition = $state<number | null>(null);
+
+	async function pollGuessStatus(requestId: string) {
+		// Poll every 1s until the job is done. Caller stays in loading=true.
+		// Server TTL on results is 1h, so no urgency on client side.
+		const POLL_MS = 1000;
+		const MAX_POLLS = 600; // 10 min safety cap
+		for (let i = 0; i < MAX_POLLS; i++) {
+			await new Promise((r) => setTimeout(r, POLL_MS));
+			const res = await fetch(
+				`${API_BASE}/guess_status?request_id=${encodeURIComponent(requestId)}`
+			);
+			if (!res.ok) throw new Error(`status poll failed: ${res.status}`);
+			const status = await res.json();
+			if (status.state === 'done') {
+				return status.result;
+			}
+			if (status.state === 'failed') {
+				throw new Error(status.error ?? 'job failed');
+			}
+			queuePosition = status.queue_position ?? null;
+		}
+		throw new Error('timed out waiting for solve');
 	}
 
 	let hint = $state<{ letter: string; value: number | null } | null>(null);
@@ -257,6 +293,7 @@ export function createGameState() {
 		get hintLoading() { return hintLoading; },
 		get hintFailed() { return hintFailed; },
 		get hintBusy() { return hintBusy; },
+		get queuePosition() { return queuePosition; },
 		newGame,
 		guess,
 		fetchHint,

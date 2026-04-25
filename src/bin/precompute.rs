@@ -16,7 +16,6 @@
 //! GB).
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -26,20 +25,60 @@ use std::time::Instant;
 use anyhow::Result;
 use clap::Parser;
 use rayon::prelude::*;
-use rustc_hash::{FxHashSet, FxHasher};
+use rustc_hash::FxHashSet;
 
 use hangman2::dictionary::Dictionary;
 use hangman2::game::letter_bit;
 use hangman2::solver::serving::{canonical_hash_for_words, decode_tt_entry, fold_required_letters};
 use hangman2::solver::{DiskCache, MemoizedSolver};
 
-/// One position queued for solving by the worker pool. Owned copies of
-/// label + indices so it's Send and rayon-friendly.
+/// One position queued for solving by the worker pool. Send/rayon-friendly.
+///
+/// We store raw label components (`depth`, `path`, `letter`, `pmask`, indices length)
+/// rather than a pre-formatted label string. The worker only formats the
+/// human-readable label in the `println!` branch — which only fires for
+/// positions that weren't already cached. For deep precomputes where most
+/// positions are cached skips, this avoids ~1B wasted string allocations
+/// on the main (producer) thread.
+///
+/// `path` is an `Arc<String>` shared across sibling positions at the same
+/// recursion level — cheap refcount bump per task instead of per-position
+/// path clone.
 struct Task {
     idx: usize,
-    label: String,
+    depth: usize,
+    path: Arc<String>,
+    letter: u8,
+    pmask: u32,
     indices: Vec<usize>,
     masked: u32,
+}
+
+fn format_label(task: &Task) -> String {
+    if task.depth == 0 {
+        return format!("d0 root {}", task.indices.len());
+    }
+    let ch = task.letter as char;
+    let kind = if task.pmask == 0 { "miss" } else { "hit" };
+    if task.path.is_empty() {
+        format!(
+            "d{} '{}' {}({:#x}) {}",
+            task.depth,
+            ch,
+            kind,
+            task.pmask,
+            task.indices.len(),
+        )
+    } else {
+        format!(
+            "d{} {}+'{}'{} {}",
+            task.depth,
+            task.path,
+            ch,
+            kind,
+            task.indices.len(),
+        )
+    }
 }
 
 #[derive(Parser)]
@@ -146,24 +185,27 @@ fn is_cached_exact(dc: &DiskCache, words: &[Vec<u8>], indices: &[usize], masked:
     dc.get(hash).and_then(decode_tt_entry).is_some()
 }
 
-/// Compute a 128-bit dedup key for a (masked, indices) position, avoiding
-/// the 4e-5 birthday-collision risk a single u64 would have at ~40M entries
-/// (k=11 depth=4). A missed dedup is harmless; a spurious collision would
-/// silently drop a unique position, which breaks strong-solution coverage.
-fn dedup_key(masked: u32, indices: &[usize]) -> (u64, u64) {
-    let mut h1 = FxHasher::default();
-    masked.hash(&mut h1);
-    indices.hash(&mut h1);
-    let mut h2 = FxHasher::default();
-    0xdead_beef_cafe_babe_u64.hash(&mut h2);
-    masked.hash(&mut h2);
-    indices.hash(&mut h2);
-    (h1.finish(), h2.finish())
+/// Dedup key = the canonical hash the LMDB cache is keyed on.
+///
+/// Two game states that are canonically equivalent (letter-permutation
+/// symmetric, etc.) produce the same hash — walker skips them after the
+/// first. This collapses the dedup set size by whatever the average
+/// equivalence-class size is (typically 5–20× at deep depths) while
+/// keeping dedup and cache-lookup consistent: if dedup says "seen",
+/// LMDB agrees it's the same canonical position.
+///
+/// Collision semantics now match LMDB's — any u64 hash collision
+/// already affects the storage layer identically, so using this single
+/// hash for dedup doesn't introduce any new correctness risk beyond
+/// what the system already tolerates.
+fn dedup_key(words: &[Vec<u8>], indices: &[usize], masked: u32) -> u128 {
+    let folded = fold_required_letters(words, indices, masked);
+    canonical_hash_for_words(words, indices, folded)
 }
 
 /// Walk the game tree up to `max_depth` in DFS letter order, invoking
 /// `callback` for each unique position. Dedup is inline via a single
-/// `FxHashSet<(u64, u64)>`, so memory scales with *unique position count*
+/// `FxHashSet<u128>` keyed by canonical hash, so memory scales with the *unique canonical position count*
 /// rather than pre-dedup enumeration count. At k=11 depth=4 this means
 /// ~1 GB of dedup state instead of ~40 GB of materialized `Position`
 /// structs (the previous implementation OOM'd on a 32 GB host).
@@ -175,6 +217,18 @@ fn dedup_key(masked: u32, indices: &[usize]) -> (u64, u64) {
 ///
 /// Returns `true` if the walk ran to completion, `false` if `callback`
 /// returned `false` (used by `--only-index` for early exit).
+/// Signature: `callback(depth, path, letter, pmask, indices, masked) -> bool`.
+///
+/// Callback receives raw label components instead of a pre-formatted string.
+/// This lets the producer (`walk_tree`) skip ~1B `format!()` calls per deep run;
+/// consumers format on demand via `format_label(&Task)`. `path` is a shared
+/// `Arc<String>` so siblings at the same recursion level reuse the same
+/// allocation — consumer stores `Arc::clone(path)` (refcount bump) instead of
+/// allocating a fresh owned copy.
+///
+/// For the root state, callback is invoked once with `depth=0, letter=0,
+/// pmask=0, path=Arc::new(String::new())`. `format_label` special-cases
+/// `depth == 0` to emit `"d0 root {count}"`.
 fn for_each_position<F>(
     words: &[Vec<u8>],
     all_indices: &[usize],
@@ -182,45 +236,43 @@ fn for_each_position<F>(
     mut callback: F,
 ) -> bool
 where
-    F: FnMut(&str, &[usize], u32) -> bool,
+    F: FnMut(usize, &Arc<String>, u8, u32, &[usize], u32) -> bool,
 {
-    // Depth 0: the root state (all words, no letters guessed). The server
-    // looks this up to display the true minimax value; without it the
-    // server falls back to a hardcoded estimate which can be materially
-    // wrong (e.g., k=4 true minimax is 14 but the estimate was 16).
-    let root_label = format!("d0 root {}", all_indices.len());
-    if !callback(&root_label, all_indices, 0) {
+    let root_path = Arc::new(String::new());
+    if !callback(0, &root_path, 0, 0, all_indices, 0) {
         return false;
     }
 
-    let mut dedup: FxHashSet<(u64, u64)> = FxHashSet::default();
+    let mut dedup: FxHashSet<u128> = FxHashSet::default();
     walk_tree(
         words,
         all_indices,
         0,
+        1,
         max_depth,
-        "",
+        &root_path,
         &mut dedup,
         &mut callback,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_tree<F>(
     words: &[Vec<u8>],
     indices: &[usize],
     masked: u32,
+    depth: usize,
     depth_remaining: usize,
-    path: &str,
-    dedup: &mut FxHashSet<(u64, u64)>,
+    path: &Arc<String>,
+    dedup: &mut FxHashSet<u128>,
     callback: &mut F,
 ) -> bool
 where
-    F: FnMut(&str, &[usize], u32) -> bool,
+    F: FnMut(usize, &Arc<String>, u8, u32, &[usize], u32) -> bool,
 {
     if depth_remaining == 0 {
         return true;
     }
-    let depth = path.chars().filter(|&c| c == '+').count() + 1;
 
     for li in 0..26u8 {
         let letter = b'a' + li;
@@ -233,30 +285,26 @@ where
             if part_indices.len() <= 1 {
                 continue;
             }
-            if !dedup.insert(dedup_key(new_masked, part_indices)) {
+            if !dedup.insert(dedup_key(words, part_indices, new_masked)) {
                 continue;
             }
-            let ch = letter as char;
-            let kind = if *pmask == 0 { "miss" } else { "hit" };
-            let label = if path.is_empty() {
-                format!("d{depth} '{ch}' {kind}({pmask:#x}) {}", part_indices.len())
-            } else {
-                format!("d{depth} {path}+'{ch}'{kind} {}", part_indices.len())
-            };
-            if !callback(&label, part_indices, new_masked) {
+            if !callback(depth, path, letter, *pmask, part_indices, new_masked) {
                 return false;
             }
 
             if depth_remaining > 1 {
-                let sub_path = if path.is_empty() {
+                let ch = letter as char;
+                let kind = if *pmask == 0 { "miss" } else { "hit" };
+                let sub_path = Arc::new(if path.is_empty() {
                     format!("'{ch}'{kind}")
                 } else {
                     format!("{path}+'{ch}'{kind}")
-                };
+                });
                 if !walk_tree(
                     words,
                     part_indices,
                     new_masked,
+                    depth + 1,
                     depth_remaining - 1,
                     &sub_path,
                     dedup,
@@ -318,33 +366,20 @@ fn main() -> Result<()> {
         }
         println!("=== k={len}: {} words ===", words.len());
 
-        let map_size = 256 * 1024 * 1024 * 1024;
+        // 1 TB: sparse on 64-bit systems (no physical disk cost until used),
+        // gives us multi-TB headroom so precomputes can't bust MDB_MAP_FULL.
+        let map_size = 1024_usize * 1024 * 1024 * 1024;
         let dc = Arc::new(DiskCache::open(&cli.cache_dir, len, &words, map_size)?);
         println!("  Disk cache: {} entries", dc.entry_count());
 
         let all_indices: Vec<usize> = (0..words.len()).collect();
 
-        // Pre-count pass: enumerate unique positions without allocating
-        // Position structs or solving, so we can report % progress during
-        // the real pass. The walk is CPU-bound on `partition_by_letter`
-        // and typically finishes in seconds; memory use matches the real
-        // pass (dedup set), so this dominates neither runtime nor RAM.
-        let count_start = Instant::now();
-        let mut total = 0usize;
-        for_each_position(
-            &words,
-            &all_indices,
-            cli.depth,
-            |_label, _indices, _masked| {
-                total += 1;
-                true
-            },
-        );
-        println!(
-            "  {total} unique positions to check (depth 0..={}, enumerated in {:.1?})",
-            cli.depth,
-            count_start.elapsed(),
-        );
+        // Pre-count pass removed: the walk itself takes hours for deep
+        // precomputes (e.g., k=4 d=9 enumerates 1.4 B positions in ~2 h),
+        // and a pre-count added a full second walk just to print the
+        // "X unique positions" header. The main pass now prints running
+        // `[pos=N]` counters so progress is visible without the duplicate
+        // walk.
 
         let solved = AtomicUsize::new(0);
         let skipped = AtomicUsize::new(0);
@@ -412,20 +447,20 @@ fn main() -> Result<()> {
                         0
                     };
 
-                    let pct = (task.idx + 1) as f64 / total as f64 * 100.0;
                     let tid = rayon::current_thread_index().unwrap_or(0);
+                    let label = format_label(task);
                     {
                         let _g = stdout_lock.lock().unwrap();
                         if flushed > 0 || flush_every == 1 {
                             println!(
-                                "  [{pct:>5.1}%] t{tid} {} => value={value}, {elapsed:.2?}, +{flushed} flushed (RSS {:.1}G)",
-                                task.label,
+                                "  [pos={}] t{tid} {label} => value={value}, {elapsed:.2?}, +{flushed} flushed (RSS {:.1}G)",
+                                task.idx,
                                 rss_gb(),
                             );
                         } else {
                             println!(
-                                "  [{pct:>5.1}%] t{tid} {} => value={value}, {elapsed:.2?} (flush in {})",
-                                task.label,
+                                "  [pos={}] t{tid} {label} => value={value}, {elapsed:.2?} (flush in {})",
+                                task.idx,
                                 flush_every - positions_since_flush,
                             );
                         }
@@ -446,7 +481,7 @@ fn main() -> Result<()> {
             batch.clear();
         };
 
-        for_each_position(&words, &all_indices, cli.depth, |label, indices, masked| {
+        for_each_position(&words, &all_indices, cli.depth, |depth, path, letter, pmask, indices, masked| {
             let idx = position_index;
             position_index += 1;
 
@@ -468,7 +503,10 @@ fn main() -> Result<()> {
 
             batch.push(Task {
                 idx,
-                label: label.to_string(),
+                depth,
+                path: Arc::clone(path),
+                letter,
+                pmask,
                 indices: indices.to_vec(),
                 masked,
             });
