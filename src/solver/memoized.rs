@@ -639,6 +639,18 @@ impl MemoizedSolver {
                 .unwrap_or(0);
             let packed = cache_pack(result, prior_best_letter, BOUND_EXACT);
             data.cache.insert(root_key, packed);
+            // Sanity: the EXACT we just wrote must be readable. If a future
+            // change to data.cache somehow loses this insert (concurrent
+            // clear, panic-recovery path, etc.), this catches it loudly
+            // rather than letting a LOWER bound silently poison the disk.
+            debug_assert!(
+                data.cache
+                    .get(&root_key)
+                    .map(|e| cache_unpack(*e).2 == BOUND_EXACT)
+                    .unwrap_or(false),
+                "force-store EXACT vanished from data.cache for root_key={:032x}",
+                root_key
+            );
         }
 
         self.hash_calls

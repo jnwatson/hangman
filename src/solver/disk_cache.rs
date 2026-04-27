@@ -204,8 +204,19 @@ impl DiskCache {
         let mut overwritten = 0u64;
         let mut rejected_exact = 0u64;
         let mut rejected_other = 0u64;
+        // Persist only EXACT entries. Bounds (LOWER/UPPER) are useful for
+        // intra-process MTD pruning but should never escape to disk: the
+        // server's `decode_tt_entry` filter rejects non-EXACT entries, and
+        // a stuck-LOWER on disk silently turns into a "cache miss" at serve
+        // time. By filtering here, the disk cache can only ever degrade to
+        // ABSENT (which a future precompute run will re-solve), never to a
+        // poisoned bound.
         let entries: Vec<(u128, u32)> = cache
             .iter()
+            .filter(|entry| {
+                let (_, _, bound) = cache_unpack(*entry.value());
+                bound == BOUND_EXACT
+            })
             .map(|entry| (*entry.key(), *entry.value()))
             .collect();
 
@@ -337,18 +348,19 @@ mod tests {
         // EXACT entries (bound bits 10-11 = 0).
         cache.insert(42, 0x0000_0005); // value=5
         cache.insert(99, 0x0000_0003); // value=3
-        // Non-EXACT entry (bound=LOWER, bit 10 set).
+        // Non-EXACT entry (bound=LOWER, bit 10 set) — should be filtered
+        // out at save time so it cannot poison serving.
         cache.insert(200, 0x0000_0005 | (1 << 10));
 
         let dc = DiskCache::open(dir.path(), 3, &words, 10 * 1024 * 1024).unwrap();
         let saved = dc.save(&cache).unwrap();
-        assert_eq!(saved, 3); // All entries including bounds
+        assert_eq!(saved, 2); // Only the two EXACT entries.
 
         assert_eq!(dc.get(42), Some(0x0000_0005));
         assert_eq!(dc.get(99), Some(0x0000_0003));
-        assert_eq!(dc.get(200), Some(0x0000_0005 | (1 << 10))); // LOWER bound
+        assert_eq!(dc.get(200), None, "bounds must not reach disk");
         assert_eq!(dc.get(12345), None);
-        assert_eq!(dc.entry_count(), 3);
+        assert_eq!(dc.entry_count(), 2);
     }
 
     #[test]
@@ -386,46 +398,46 @@ mod tests {
     }
 
     #[test]
-    fn save_overwrites_bound_with_tighter_same_type() {
+    fn save_filters_bounds_only_exact_persists() {
         use super::super::memoized::cache_pack;
         let dir = TempDir::new().unwrap();
         let words = test_words();
         let dc = DiskCache::open(dir.path(), 3, &words, 10 * 1024 * 1024).unwrap();
 
-        // First: UPPER value=10 (value ≤ 10).
+        // Try to save an UPPER bound. It must be silently dropped — bounds
+        // never escape to disk because the server treats non-EXACT entries
+        // as cache misses, and a stuck bound silently degrades serving.
         let first: DashMap<u128, u32> = DashMap::new();
         first.insert(42, cache_pack(10, b'a', BOUND_UPPER));
-        dc.save(&first).unwrap();
+        let written = dc.save(&first).unwrap();
+        assert_eq!(written, 0, "UPPER must not reach disk");
+        assert_eq!(dc.get(42), None);
 
-        // Second: UPPER value=7 (tighter upper bound; dominates).
+        // LOWER bound: also dropped.
         let second: DashMap<u128, u32> = DashMap::new();
-        second.insert(42, cache_pack(7, b'a', BOUND_UPPER));
+        second.insert(43, cache_pack(5, b'a', BOUND_LOWER));
         let written = dc.save(&second).unwrap();
-        assert_eq!(written, 1);
-        let (val, _, bound) = cache_unpack(dc.get(42).unwrap());
-        assert_eq!((val, bound), (7, BOUND_UPPER));
+        assert_eq!(written, 0, "LOWER must not reach disk");
+        assert_eq!(dc.get(43), None);
 
-        // Third: UPPER value=12 (looser; should not overwrite).
+        // EXACT writes through normally.
         let third: DashMap<u128, u32> = DashMap::new();
-        third.insert(42, cache_pack(12, b'a', BOUND_UPPER));
+        third.insert(42, cache_pack(7, b'a', BOUND_EXACT));
         let written = dc.save(&third).unwrap();
-        assert_eq!(written, 0);
-        let (val, _, _) = cache_unpack(dc.get(42).unwrap());
-        assert_eq!(val, 7, "looser upper bound must not overwrite tighter");
-
-        // Fourth: LOWER value=3 — different bound type, should not overwrite.
-        let fourth: DashMap<u128, u32> = DashMap::new();
-        fourth.insert(42, cache_pack(3, b'a', BOUND_LOWER));
-        let written = dc.save(&fourth).unwrap();
-        assert_eq!(written, 0);
-
-        // Fifth: EXACT value=5 — always wins over bound.
-        let fifth: DashMap<u128, u32> = DashMap::new();
-        fifth.insert(42, cache_pack(5, b'a', BOUND_EXACT));
-        let written = dc.save(&fifth).unwrap();
         assert_eq!(written, 1);
         let (val, _, bound) = cache_unpack(dc.get(42).unwrap());
-        assert_eq!((val, bound), (5, BOUND_EXACT));
+        assert_eq!((val, bound), (7, BOUND_EXACT));
+
+        // Mixed batch: only the EXACT entries land.
+        let fourth: DashMap<u128, u32> = DashMap::new();
+        fourth.insert(100, cache_pack(3, b'a', BOUND_EXACT));
+        fourth.insert(101, cache_pack(4, b'a', BOUND_LOWER));
+        fourth.insert(102, cache_pack(2, b'a', BOUND_UPPER));
+        let written = dc.save(&fourth).unwrap();
+        assert_eq!(written, 1, "only the EXACT in the batch");
+        assert!(dc.get(100).is_some());
+        assert_eq!(dc.get(101), None);
+        assert_eq!(dc.get(102), None);
     }
 
     #[test]
