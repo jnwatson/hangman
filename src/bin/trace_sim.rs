@@ -106,7 +106,10 @@ fn lcg_next(state: &mut u64) -> u64 {
 }
 
 /// Simulate one full server turn for a given (state, letter). Returns
-/// (turn_wall_time_ms, worst_partition_indices, worst_partition_masked, worst_value).
+/// (turn_wall_time_ms, worst_partition_indices, worst_partition_masked,
+/// worst_value, n_partitions, n_cache_misses). Misses count partitions
+/// where Phase 1 found no EXACT entry — i.e. the server would treat them
+/// as cache misses and either live-solve or report degraded.
 #[allow(clippy::too_many_arguments)]
 fn simulate_turn(
     words: &[Vec<u8>],
@@ -116,7 +119,7 @@ fn simulate_turn(
     solver: &MemoizedSolver,
     turn_deadline_secs: u64,
     per_partition_secs: u64,
-) -> (u64, Vec<usize>, u32, u32) {
+) -> (u64, Vec<usize>, u32, u32, usize, usize) {
     let t0 = Instant::now();
     let new_masked = state.masked | letter_bit(letter);
     let parts = partition_by_letter(words, &state.indices, letter);
@@ -184,10 +187,12 @@ fn simulate_turn(
     }
 
     let turn_ms = t0.elapsed().as_millis() as u64;
+    let n_partitions = parts_vec.len();
+    let n_misses = unsolved.len();
     let (_pmask, indices) = parts_vec.swap_remove(best_idx);
     // The guessed letter is always added to `masked` — it has been claimed
     // whether the referee answered miss (0) or hit (pmask != 0).
-    (turn_ms, indices, new_masked, best_val)
+    (turn_ms, indices, new_masked, best_val, n_partitions, n_misses)
 }
 
 /// Pick a letter for this state using the configured strategy.
@@ -290,6 +295,12 @@ fn main() -> Result<()> {
     let mut slow_turns: Vec<(u64, String)> = Vec::new();
     let mut timeouts: u64 = 0;
     let mut first_turn_ms: Vec<u64> = Vec::new();
+    // Cache health: count partitions with no EXACT entry. This is the
+    // metric the server uses to set "degraded"/"unresolved" status.
+    let mut total_partitions: usize = 0;
+    let mut total_misses: usize = 0;
+    let mut turns_with_miss: usize = 0;
+    let mut max_miss_per_turn: usize = 0;
 
     let run_start = Instant::now();
     for trace_i in 0..cli.traces {
@@ -301,7 +312,7 @@ fn main() -> Result<()> {
         let mut trace_log: Vec<(u8, u64)> = Vec::new();
         while state.indices.len() > 1 && state.turns < cli.max_turns {
             let letter = pick_letter(&cli.strategy, &words, &state, &dc, &mut rng);
-            let (turn_ms, new_indices, new_masked, _worst_val) =
+            let (turn_ms, new_indices, new_masked, _worst_val, n_parts, n_miss) =
                 simulate_turn(&words, &state, letter, &dc, &solver,
                               cli.turn_deadline_secs, cli.per_partition_secs);
             trace_log.push((letter, turn_ms));
@@ -309,10 +320,18 @@ fn main() -> Result<()> {
             if state.turns == 0 {
                 first_turn_ms.push(turn_ms);
             }
+            total_partitions += n_parts;
+            total_misses += n_miss;
+            if n_miss > 0 {
+                turns_with_miss += 1;
+                if n_miss > max_miss_per_turn {
+                    max_miss_per_turn = n_miss;
+                }
+            }
             let label = format!(
-                "trace#{trace_i} turn#{} letter={} left={} -> {} ({}ms)",
+                "trace#{trace_i} turn#{} letter={} left={} -> {} ({}ms parts={} miss={})",
                 state.turns, letter as char, state.indices.len(),
-                new_indices.len(), turn_ms
+                new_indices.len(), turn_ms, n_parts, n_miss
             );
             if turn_ms > max_turn.0 {
                 max_turn = (turn_ms, label.clone());
@@ -325,10 +344,11 @@ fn main() -> Result<()> {
             }
 
             if cli.verbose || cli.traces == 1 {
+                let flag = if n_miss > 0 { " ⚠" } else { "" };
                 println!(
-                    "  trace#{trace_i} turn#{} letter={} left={} -> {} ({}ms)",
+                    "  trace#{trace_i} turn#{} letter={} left={} -> {} ({}ms parts={} miss={}){}",
                     state.turns, letter as char,
-                    state.indices.len(), new_indices.len(), turn_ms,
+                    state.indices.len(), new_indices.len(), turn_ms, n_parts, n_miss, flag,
                 );
             }
 
@@ -360,6 +380,16 @@ fn main() -> Result<()> {
     println!("timeouts (>={}s):       {}", cli.turn_deadline_secs, timeouts);
     println!("turns >= {}s (slow):    {}", cli.warn_secs, slow_turns.len());
     println!("wall time:             {:.1}s", run_start.elapsed().as_secs_f64());
+    println!("\n=== cache health ===");
+    println!("total partitions:      {}", total_partitions);
+    println!("partitions w/o EXACT:  {}", total_misses);
+    println!("turns with any miss:   {} / {}", turns_with_miss, n);
+    println!("max misses in 1 turn:  {}", max_miss_per_turn);
+    if total_misses == 0 {
+        println!("✓ cache is FULLY EXACT on the simulated path — no degraded turns");
+    } else {
+        println!("⚠ cache has {} non-EXACT partitions on this path — server would mark turns degraded/unresolved", total_misses);
+    }
 
     if !slow_turns.is_empty() {
         slow_turns.sort_by(|a, b| b.0.cmp(&a.0));
