@@ -118,29 +118,33 @@
 
 			<span class="word-length-label">{game.state.wordLength} letters</span>
 
-			{#if game.state.wrongLetters.length > 0}
-				<div class="wrong-letters">
-					<span class="wrong-label">Wrong:</span>
-					{#each game.state.wrongLetters as letter}
-						<span class="wrong-letter">{letter}</span>
-					{/each}
-				</div>
-			{/if}
+			<div class="wrong-letters-slot">
+				{#if game.state.wrongLetters.length > 0}
+					<div class="wrong-letters">
+						<span class="wrong-label">Wrong:</span>
+						{#each game.state.wrongLetters as letter}
+							<span class="wrong-letter">{letter}</span>
+						{/each}
+					</div>
+				{/if}
+			</div>
 
-			{#if game.loading}
-				<div class="thinking">
-					<span class="thinking-dot"></span>
-					<span class="thinking-dot"></span>
-					<span class="thinking-dot"></span>
-					{#if game.queuePosition && game.queuePosition > 7}
-						<span class="queue-position">Queue position {game.queuePosition - 7}</span>
-					{/if}
-				</div>
-			{:else if game.state.solveStatus === 'degraded'}
-				<div class="solve-status degraded">Degraded — some positions uncached</div>
-			{:else if game.state.solveStatus === 'unresolved'}
-				<div class="solve-status unresolved">Unresolved — referee is guessing</div>
-			{/if}
+			<div class="status-slot">
+				{#if game.loading}
+					<div class="thinking">
+						<span class="thinking-dot"></span>
+						<span class="thinking-dot"></span>
+						<span class="thinking-dot"></span>
+						{#if game.queuePosition && game.queuePosition > 7}
+							<span class="queue-position">Queue position {game.queuePosition - 7}</span>
+						{/if}
+					</div>
+				{:else if game.state.solveStatus === 'degraded'}
+					<div class="solve-status degraded">Degraded — some positions uncached</div>
+				{:else if game.state.solveStatus === 'unresolved'}
+					<div class="solve-status unresolved">Unresolved — referee is guessing</div>
+				{/if}
+			</div>
 
 			<Keyboard
 				guessedLetters={game.state.guessedLetters}
@@ -414,6 +418,23 @@
 		animation: pulse-danger 1s ease-in-out infinite;
 	}
 
+	.wrong-letters-slot {
+		/* Reserve space for the wrong-letters row so the keyboard doesn't
+		   shift down after the first wrong guess. Tallest content is one
+		   .wrong-letter chip with default line-height ~1.5 → 1.1rem*1.5 +
+		   0.4rem padding = ~2.05rem. Slot must be ≥ that to stay stable. */
+		min-height: 2.1rem;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.wrong-letter {
+		/* Tighten line-height so the chip's box height stays predictable
+		   and within the slot reservation. */
+		line-height: 1.2;
+	}
+
 	.wrong-letters {
 		display: flex;
 		align-items: center;
@@ -435,6 +456,16 @@
 		padding: 0.2rem 0.4rem;
 		background: rgba(139, 34, 51, 0.15);
 		border-radius: 3px;
+	}
+
+	.status-slot {
+		/* Reserve space for the tallest possible child (.solve-status with
+		   padding + border) so the keyboard below doesn't jump as the
+		   thinking dots / status messages appear and disappear. */
+		min-height: 2rem;
+		display: flex;
+		align-items: center;
+		justify-content: center;
 	}
 
 	.solve-status {
