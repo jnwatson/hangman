@@ -21,7 +21,7 @@ FLEET = Path("/home/nic/proj/hangman2/scripts/fleet.json")
 SSH_OPTS = [
     "-o", "StrictHostKeyChecking=accept-new",
     "-o", "UserKnownHostsFile=/home/nic/.ssh/known_hosts_hangman",
-    "-o", "ConnectTimeout=10",
+    "-o", "ConnectTimeout=60",
     "-o", "BatchMode=yes",
 ]
 
@@ -39,8 +39,11 @@ if [ -f "$LOG" ]; then
     MTIME=$(stat -c %Y "$LOG")
     SIZE=$(stat -c %s "$LOG")
     LAST=$(tail -1 "$LOG" 2>/dev/null | tr '\t' ' ' | cut -c1-100)
-    PCT=$(grep -oE '\[ *[0-9]+\.[0-9]+%\]' "$LOG" 2>/dev/null | tail -1 | tr -d '[]% ')
-    FINISHED=$(grep -cE 's total$|^Done: ' "$LOG" 2>/dev/null || echo 0)
+    # Only scan the last few MB — log files can grow to 50+ GB and a full
+    # regex scan over them blocks for tens of seconds on loaded boxes.
+    TAIL_BYTES=4194304
+    PCT=$(tail -c $TAIL_BYTES "$LOG" 2>/dev/null | grep -oE '\[ *[0-9]+\.[0-9]+%\]' | tail -1 | tr -d '[]% ')
+    FINISHED=$(tail -c $TAIL_BYTES "$LOG" 2>/dev/null | grep -cE 's total$|^Done: ' || echo 0)
 else
     MTIME=0; SIZE=0; LAST=""; PCT=""; FINISHED=0
 fi
@@ -83,13 +86,13 @@ def _build_probe(log, log_glob, pid_match):
 def probe_ssh(m):
     ip = m["ip"]
     user = m.get("user", "root")
-    log = m.get("log_path", "/root/precompute.log")
-    log_glob = m.get("log_glob", "")
-    pid_match = m.get("pid_match", "")
+    log = m.get("log_path") or "/root/precompute.log"
+    log_glob = m.get("log_glob") or ""
+    pid_match = m.get("pid_match") or ""
     try:
         r = subprocess.run(
             ["ssh", *SSH_OPTS, f"{user}@{ip}", _build_probe(log, log_glob, pid_match)],
-            capture_output=True, text=True, timeout=25,
+            capture_output=True, text=True, timeout=80,
         )
         if r.returncode != 0:
             return {"error": (r.stderr or r.stdout).strip()[:80] or "ssh failed"}
@@ -188,9 +191,13 @@ def classify(p):
     if "error" in p:
         return ("ERROR", p["error"][:50])
     if p["pid"]:
+        # Trust an actively-running CPU signal over log staleness — the verify
+        # pass has multi-hour silent enumeration phases before the first solve.
+        if p.get("cpu", 0) >= 50.0:
+            return ("RUN", f"{p['threads']}t {p['cpu']:.0f}%cpu")
         age = (datetime.datetime.now().timestamp() - p["log_mtime"]) if p["log_mtime"] else None
         if age is not None and age > 1800:
-            return ("STALL", f"no log in {int(age)}s")
+            return ("STALL", f"no log in {int(age)}s, cpu={p.get('cpu', 0):.0f}%")
         return ("RUN", f"{p['threads']}t {p['cpu']:.0f}%cpu")
     if p["finished"] and p["finished"] > 0:
         return ("DONE", f"{p['finished']} stage(s) complete")
@@ -206,13 +213,18 @@ def fmt_age(secs):
 
 
 def fmt_cost(m):
+    # Prepaid boxes (ovh1, hc4): the monthly fee is sunk regardless of usage,
+    # so display the booked monthly cost as-is rather than accruing per-hour.
+    prepaid = m.get("prepaid_monthly_usd")
+    if prepaid:
+        return f"${prepaid:.2f}"
     try:
         start = datetime.datetime.fromisoformat(m["started_at"])
     except Exception:
         return "?"
     elapsed_hr = (datetime.datetime.now(start.tzinfo) - start).total_seconds() / 3600
     cost = elapsed_hr * m.get("cost_per_hr_usd", 0)
-    cap = m.get("cost_monthly_cap_usd")
+    cap = m.get("monthly_cap_usd") or m.get("cost_monthly_cap_usd")
     if cap:
         cost = min(cost, cap)
     return f"${cost:.2f}" if cost >= 0.01 else "$0"
@@ -225,13 +237,24 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
         futures = {}
         for m in fleet:
-            if m["probe"] == "local":
+            # Completed entries don't need probing — process is gone, log
+            # is final. Mark as DONE without an SSH round-trip.
+            if m.get("completed_at"):
+                futures[m["id"]] = None
+            elif m["probe"] == "local":
                 futures[m["id"]] = ex.submit(probe_local, m)
             elif m["probe"] == "ssh":
                 futures[m["id"]] = ex.submit(probe_ssh, m)
             else:
                 futures[m["id"]] = None
-        results = {mid: (f.result() if f else {"pending": True}) for mid, f in futures.items()}
+        results = {}
+        for mid, f in futures.items():
+            if f:
+                results[mid] = f.result()
+            else:
+                # Find the entry to decide between completed (DONE) and queued (PENDING).
+                m = next(x for x in fleet if x["id"] == mid)
+                results[mid] = {"completed": True} if m.get("completed_at") else {"pending": True}
 
     print(f"fleet_status @ {datetime.datetime.now().strftime('%H:%M:%S')}")
     hdr = f"{'ID':<32} {'STATE':<7} {'PROG':>6} {'RSS':>6} {'LOG-AGE':>8} {'COST':>7}  NOTE / LAST LINE"
@@ -244,6 +267,15 @@ def main():
         if p.get("pending"):
             line = f"{m['id']:<32} {'WAIT':<7} {'':>6} {'':>6} {'':>8} {'$0':>7}  {m['job']}"
             print(line)
+            continue
+        if p.get("completed"):
+            cost = fmt_cost(m)
+            try:
+                total_cost += float(cost.lstrip("$"))
+            except ValueError:
+                pass
+            note = (m.get("job") or "")[:60]
+            print(f"{m['id']:<32} {'DONE':<7} {'':>6} {'':>6} {'':>8} {cost:>7}  {note}")
             continue
         state, note = classify(p)
         rss = f"{p.get('rss_gb', 0):.1f}G" if p.get("rss_gb", 0) > 0.05 else ""
