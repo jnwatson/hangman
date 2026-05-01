@@ -541,11 +541,26 @@
 
 		.panel-right {
 			order: -1;
-			padding-top: 1rem;
+			padding-top: 0.5rem;
 		}
 
 		.gallows-container {
 			position: static;
+		}
+
+		/* Shrink the gallows SVG by ~⅓ on mobile — desktop keeps size=220
+		   prop, but on narrow viewports the inline width/height attrs are
+		   overridden via CSS so it fits without dominating the screen. */
+		.gallows-container :global(svg.gallows) {
+			width: 147px !important;
+			height: 176px !important;
+		}
+
+		/* Tighten vertical gaps so the keyboard sits closer to the
+		   word display — reduces unnecessary scrolling on phones. */
+		.game-center {
+			gap: 0.5rem;
+			padding-top: 0.5rem;
 		}
 	}
 

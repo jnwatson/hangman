@@ -14,3 +14,17 @@ web/node_modules
 web/.svelte-kit
 web/.vscode
 /.claude/scheduled_tasks.lock
+
+# Local-only files containing infrastructure IPs / secrets
+/CLAUDE.md
+/.claude/
+/scripts/cax_machines.json
+/scripts/cleanup_queue.json
+/scripts/CLEANUP_TODO.md
+/scripts/fleet.json
+/scripts/migration_plan.md
+/scripts/orchestrate_cleanup.py
+/scripts/compute-depth3.sh
+/scripts/deploy.sh
+/scripts/deploy_new.sh
+/scripts/watcher.sh

@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="40%" r="70%">
+      <stop offset="0%" stop-color="#1a1a2e"/>
+      <stop offset="100%" stop-color="#0a0a0f"/>
+    </radialGradient>
+    <filter id="glow"><feGaussianBlur stdDeviation="6"/></filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="630" fill="url(#bg)"/>
+
+  <!-- Gallows (left side, dim) -->
+  <g transform="translate(160 80)" stroke="#3d3647" stroke-width="6" stroke-linecap="round" fill="none">
+    <line x1="0" y1="430" x2="220" y2="430"/>
+    <line x1="60" y1="430" x2="60" y2="20"/>
+    <line x1="60" y1="20" x2="220" y2="20"/>
+    <line x1="220" y1="20" x2="220" y2="60"/>
+    <!-- Hanged figure -->
+    <g stroke="#6b3fa0">
+      <circle cx="220" cy="100" r="32" fill="none"/>
+      <line x1="220" y1="132" x2="220" y2="240"/>
+      <line x1="220" y1="160" x2="180" y2="200"/>
+      <line x1="220" y1="160" x2="260" y2="200"/>
+      <line x1="220" y1="240" x2="190" y2="300"/>
+      <line x1="220" y1="240" x2="250" y2="300"/>
+    </g>
+    <!-- X eyes -->
+    <g stroke="#c0392b" stroke-width="4">
+      <line x1="207" y1="92" x2="217" y2="102"/>
+      <line x1="217" y1="92" x2="207" y2="102"/>
+      <line x1="223" y1="92" x2="233" y2="102"/>
+      <line x1="233" y1="92" x2="223" y2="102"/>
+    </g>
+  </g>
+
+  <!-- Title (Creepster — same display font as the landing page).
+       Raised 16px (half the byline font-size) to give the tagline below
+       more breathing room without moving the tagline. -->
+  <g font-family="Creepster, cursive" text-anchor="start" font-weight="400">
+    <text x="540" y="264" font-size="160" fill="#8b2233" letter-spacing="6">Dead</text>
+    <text x="540" y="414" font-size="160" fill="#e8dcc8" letter-spacing="6">Letters</text>
+  </g>
+
+  <!-- Tagline -->
+  <text x="540" y="470" font-family="Georgia, serif" font-size="32" font-style="italic" fill="#8a7f6f">
+    The hardest game of hangman
+  </text>
+  <text x="540" y="510" font-family="Georgia, serif" font-size="32" font-style="italic" fill="#8a7f6f">
+    you'll ever play.
+  </text>
+
+  <!-- URL -->
+  <text x="600" y="585" font-family="monospace" font-size="22" fill="#6b6575" text-anchor="middle">
+    deadletters.fun
+  </text>
+</svg>
