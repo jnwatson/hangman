@@ -10,14 +10,14 @@ This project computes **minimax-optimal strategies** for both sides: the provabl
 
 ## Minimax Results
 
-Optimal miss counts for every word length (enable1.txt, 172,820 words):
+Optimal miss counts for every word length (enable1.txt, 172,819 words):
 
 | Length | Words | Optimal Misses |
 |--------|-------|----------------|
 | 2 | 96 | 14 |
 | 3 | 972 | 17 |
-| 4 | 3,903 | 16 |
-| 5 | 8,636 | 15 |
+| 4 | 3,903 | 14 |
+| 5 | 8,636 | 13 |
 | 6 | 15,232 | 12 |
 | 7 | 23,109 | 11 |
 | 8 | 28,420 | 8 |
@@ -27,7 +27,7 @@ Optimal miss counts for every word length (enable1.txt, 172,820 words):
 | 12 | 11,357 | 4 |
 | 13 | 7,827 | 4 |
 | 14 | 5,127 | 3 |
-| 15 | 3,192 | 3 |
+| 15 | 3,192 | 2 |
 | 16 | 1,943 | 2 |
 | 17 | 1,127 | 2 |
 | 18 | 594 | 2 |
@@ -53,7 +53,7 @@ src/              Core library (game logic, solver, dictionary)
   bin/            Precompute, benchmarking, and diagnostic tools
 server/           Axum HTTP server (game API + hint endpoint)
 web/              SvelteKit frontend (static site)
-deploy.sh         Production deployment script
+scripts/          Build, deploy, and operational helpers
 ```
 
 ## Building
@@ -92,8 +92,10 @@ target/release/dead-letters-server \
 ```
 
 The server provides:
+- `GET /api/health` — Liveness check
 - `GET /api/new?length=N` — Start a new game
 - `POST /api/guess` — Submit a letter guess (referee responds optimally)
+- `GET /api/guess_status?game_id=ID&job_id=J` — Poll for an async-queued guess result
 - `GET /api/hint?game_id=ID` — Get the best move for the guesser
 - `GET /api/wordlist?length=N` — Get all words of a given length
 
