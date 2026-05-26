@@ -3,11 +3,9 @@
 # START_D..MAX_D, pushes cache to deadletters.fun between depths.
 # Breaks on non-zero exit.
 #
-# After each depth's main run, runs the SAME precompute again as a
-# verification pass: most positions are already EXACT and skip via
-# is_cached_exact, so it's quick. If the verify pass solves any
-# positions, that's evidence the main pass dropped some force-stores —
-# the verify pass repairs them before push.
+# Verify pass was removed: it skips already-EXACT entries via is_cached_exact,
+# so it cannot scrub wrong-EXACT entries left by pre-99d8566 buggy binaries.
+# Only fix is to wipe and rebuild from scratch, which is what we now do.
 #
 # Disk-space sanity check before rsync so we never fill prod.
 
@@ -37,14 +35,26 @@ CACHE_DIR=tt_len${K}_${HASH}
 NTFY=hangman2-compute-nic
 HOST=$(hostname)
 PROD=hc4-prod
-HOMEDIR=/home/nic/proj
 SAFETY_BYTES=10737418240  # 10 GB headroom
+
+# HOMEDIR contains the hangman2 project dir and is where per-depth log
+# files land. Auto-detected so the same script works on local (~/proj/
+# hangman2) and ovh1 (~/hangman2). Override via env if neither matches.
+if [ -z "${HOMEDIR:-}" ]; then
+  if [ -d "$HOME/proj/hangman2" ]; then
+    HOMEDIR="$HOME/proj"
+  elif [ -d "$HOME/hangman2" ]; then
+    HOMEDIR="$HOME"
+  else
+    echo "ERROR: cannot find hangman2/ in \$HOME or \$HOME/proj. Set HOMEDIR= explicitly." >&2
+    exit 1
+  fi
+fi
 
 cd $HOMEDIR/hangman2
 
 run_precompute() {
-  local label="$1"
-  local logfile="$2"
+  local logfile="$1"
   /usr/bin/time -v ./target/release/precompute \
     --dict enable1.txt \
     --lengths $K \
@@ -61,25 +71,14 @@ for D in $(seq $START_D $MAX_D); do
   # Main pass.
   LOG=$HOMEDIR/precompute_k${K}_d${D}.log
   [ -f "$LOG" ] && mv "$LOG" "${LOG}.$(date +%Y%m%d_%H%M%S)"
-  run_precompute "main" "$LOG"
+  run_precompute "$LOG"
   RC=$?
   curl -sd "chain END $HOST k=$K d=$D rc=$RC" "https://ntfy.sh/$NTFY" > /dev/null 2>&1 || true
   [ $RC -ne 0 ] && break
 
-  # Verify pass: same args, second invocation. is_cached_exact skips EXACT
-  # entries; non-EXACT (or missing) entries get re-solved. Catches dropped
-  # force-stores from the main pass before they reach prod.
-  VLOG=$HOMEDIR/precompute_k${K}_d${D}.verify.log
-  [ -f "$VLOG" ] && mv "$VLOG" "${VLOG}.$(date +%Y%m%d_%H%M%S)"
-  run_precompute "verify" "$VLOG"
-  VRC=$?
-  VSOLVED=$(grep -E "^  Done:" "$VLOG" | grep -oE "[0-9]+ solved" | grep -oE "[0-9]+" || echo "?")
-  curl -sd "verify END $HOST k=$K d=$D rc=$VRC solved=$VSOLVED" "https://ntfy.sh/$NTFY" > /dev/null 2>&1 || true
-  [ $VRC -ne 0 ] && break
-
   # Push cache to prod. Prefer mdb_copy -c (compacts free pages); fall back
-  # to cp --sparse=auto if mdb_copy isn't installed. Safe because main+verify
-  # have exited before this step — no concurrent writers.
+  # to cp --sparse=auto if mdb_copy isn't installed. Safe because the main
+  # pass has exited before this step — no concurrent writers.
   mkdir -p /tmp/snap_$CACHE_DIR
   if command -v mdb_copy >/dev/null 2>&1; then
     mdb_copy -c game_cache/$CACHE_DIR /tmp/snap_$CACHE_DIR/ 2>&1 | tail -3
@@ -122,19 +121,21 @@ for D in $(seq $START_D $MAX_D); do
   ssh $PROD "mkdir -p /opt/dead-letters/cache_stage/$CACHE_DIR"
   PUSH_RC=0
   rsync -az /tmp/snap_$CACHE_DIR/data.mdb $PROD:/opt/dead-letters/cache_stage/$CACHE_DIR/ || PUSH_RC=$?
-  # IMPORTANT: also wipe lock.mdb. saferlmdb keys reader-table state to a
-  # specific data.mdb epoch; replacing data.mdb without invalidating lock.mdb
-  # leaves new readers seeing a stale empty index (issue #70 — silent push
-  # failures that lost weeks of compute coverage on prod).
-  ssh $PROD "sudo mv /opt/dead-letters/cache_stage/$CACHE_DIR/data.mdb /opt/dead-letters/cache/$CACHE_DIR/data.mdb && sudo chown www:www /opt/dead-letters/cache/$CACHE_DIR/data.mdb && sudo rm -f /opt/dead-letters/cache/$CACHE_DIR/lock.mdb && sudo rmdir /opt/dead-letters/cache_stage/$CACHE_DIR" || PUSH_RC=$?
+  # Ensure live cache dir exists (it may not after a wipe). Then move the
+  # staged file into place. IMPORTANT: also wipe lock.mdb. saferlmdb keys
+  # reader-table state to a specific data.mdb epoch; replacing data.mdb
+  # without invalidating lock.mdb leaves new readers seeing a stale empty
+  # index (issue #70 — silent push failures that lost weeks of compute
+  # coverage on prod).
+  ssh $PROD "sudo mkdir -p /opt/dead-letters/cache/$CACHE_DIR && sudo chown www:www /opt/dead-letters/cache/$CACHE_DIR && sudo mv /opt/dead-letters/cache_stage/$CACHE_DIR/data.mdb /opt/dead-letters/cache/$CACHE_DIR/data.mdb && sudo chown www:www /opt/dead-letters/cache/$CACHE_DIR/data.mdb && sudo rm -f /opt/dead-letters/cache/$CACHE_DIR/lock.mdb && sudo rmdir /opt/dead-letters/cache_stage/$CACHE_DIR" || PUSH_RC=$?
   # Restart prod service so it sees the new data.mdb (mmap of replaced inode
   # otherwise sticks to the old file).
   ssh $PROD "sudo systemctl restart dead-letters" || PUSH_RC=$?
   rm -rf /tmp/snap_$CACHE_DIR
   if [ $PUSH_RC -ne 0 ]; then
     curl -sd "chain push FAILED $HOST k=$K d=$D rc=$PUSH_RC" "https://ntfy.sh/$NTFY" > /dev/null 2>&1 || true
-    break
+    exit $PUSH_RC
   fi
-  curl -sd "chain pushed $HOST k=$K d=$D snap=${SNAP_GB}GB verify_solved=$VSOLVED" "https://ntfy.sh/$NTFY" > /dev/null 2>&1 || true
+  curl -sd "chain pushed $HOST k=$K d=$D snap=${SNAP_GB}GB" "https://ntfy.sh/$NTFY" > /dev/null 2>&1 || true
 done
 curl -sd "chain FINISHED $HOST k=$K (covered up to d=$MAX_D)" "https://ntfy.sh/$NTFY" > /dev/null 2>&1 || true

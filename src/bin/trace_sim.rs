@@ -270,6 +270,7 @@ fn pick_letter(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let dict = Dictionary::from_file(&cli.dict)?;

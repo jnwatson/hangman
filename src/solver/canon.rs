@@ -80,65 +80,6 @@ pub(super) fn dedup_and_hash(
     dedup_and_hash_general(words, indices, masked, k)
 }
 
-/// Dedup only: collapse identical effective signatures without computing
-/// the canonical hash. Used when the canonical key is already known from
-/// the `key_cache` but the TT missed.
-pub(super) fn dedup_only(
-    words: &[Vec<u8>],
-    indices: &[usize],
-    masked: u32,
-) -> Vec<usize> {
-    if indices.is_empty() {
-        return vec![];
-    }
-    let k = words[indices[0]].len();
-    if k == 0 {
-        return indices.to_vec();
-    }
-
-    if k <= 8 {
-        return dedup_only_small_k(words, indices, masked, k);
-    }
-
-    // For k > 8, fall back to the full function and discard the hash.
-    dedup_and_hash(words, indices, masked).0
-}
-
-/// Fast dedup for k ≤ 8: encode each sig as u64, sort, and dedup.
-/// Skips the expensive canonicalization step (relabel + column permutation).
-fn dedup_only_small_k(
-    words: &[Vec<u8>],
-    indices: &[usize],
-    masked: u32,
-    k: usize,
-) -> Vec<usize> {
-    use crate::game::letter_bit;
-
-    let n = indices.len();
-    let mut pairs: Vec<(u64, usize)> = Vec::with_capacity(n);
-    for &idx in indices {
-        let word = &words[idx];
-        let mut key = 0u64;
-        for &b in word.iter().take(k) {
-            let eff = if masked & letter_bit(b) != 0 { 0 } else { b };
-            key = key << 8 | u64::from(eff);
-        }
-        pairs.push((key, idx));
-    }
-
-    pairs.sort_unstable();
-
-    let mut deduped: Vec<usize> = Vec::new();
-    let mut prev_key = u64::MAX;
-    for &(key, idx) in &pairs {
-        if key != prev_key {
-            prev_key = key;
-            deduped.push(idx);
-        }
-    }
-    deduped
-}
-
 /// Specialized path for k ≤ 8: encode each sig as a u64.
 fn dedup_and_hash_small_k(
     words: &[Vec<u8>],
@@ -449,16 +390,16 @@ fn canonicalize_sorted_rows(buf: &mut [u8], m: usize, k: usize) -> u128 {
         return 0;
     }
 
-    // Drop all-zero columns if present. Operates on a slice because when all
-    // columns are live we can skip allocation entirely.
-    let (buf, k) = match collapse_zero_cols(buf, m, k) {
-        Some((owned, ek)) => (owned, ek),
-        None => (buf[..m * k].to_vec(), k),
+    // Drop all-zero columns if present. The `live` bitmask records WHICH
+    // columns survived — this is mixed into the final hash to distinguish
+    // states that have the same non-zero pattern at different positions
+    // (e.g. (0,X,0,Y,...) vs (X,0,Y,0,...) both collapse to (X,Y) but
+    // have different game semantics because position matters in hangman).
+    let (buf, k, col_mask) = match collapse_zero_cols(buf, m, k) {
+        Some((owned, ek, live)) => (owned, ek, live),
+        None => (buf[..m * k].to_vec(), k, u64::MAX),
     };
     if k == 0 {
-        // All columns were dead — all sigs are empty. Distinct rows are
-        // impossible here (they would have had the same u64 key and been
-        // deduped). Return 0 as the canonical hash of "zero useful state."
         return 0;
     }
 
@@ -474,7 +415,22 @@ fn canonicalize_sorted_rows(buf: &mut [u8], m: usize, k: usize) -> u128 {
         relabel_flat(&mut buf);
     }
 
-    hash_flat(&buf)
+    // Mix the dead-column mask into the hash so that states with the same
+    // non-zero content but different live-column positions get distinct keys.
+    let content_hash = hash_flat(&buf);
+    if col_mask == u64::MAX {
+        content_hash
+    } else {
+        let mut hasher = std::hash::DefaultHasher::new();
+        content_hash.hash(&mut hasher);
+        col_mask.hash(&mut hasher);
+        let h1 = hasher.finish();
+        let mut hasher2 = std::hash::DefaultHasher::new();
+        h1.hash(&mut hasher2);
+        col_mask.hash(&mut hasher2);
+        let h2 = hasher2.finish();
+        u128::from(h1) | (u128::from(h2) << 64)
+    }
 }
 
 /// Check for all-zero columns in a row-major m×k buffer. Returns `None` if
@@ -485,7 +441,7 @@ fn canonicalize_sorted_rows(buf: &mut [u8], m: usize, k: usize) -> u128 {
 /// Preserves row order: since dead columns have byte 0 in every row, they
 /// can't affect lex ordering of rows, so post-collapse rows are still sorted
 /// if the pre-collapse rows were.
-fn collapse_zero_cols(buf: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, usize)> {
+fn collapse_zero_cols(buf: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, usize, u64)> {
     if k == 0 || m == 0 {
         return None;
     }
@@ -499,7 +455,6 @@ fn collapse_zero_cols(buf: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, usize)
                 live |= 1u64 << j;
             }
         }
-        // Early exit: every column already has a non-zero byte.
         if live.count_ones() as usize == k {
             return None;
         }
@@ -520,7 +475,7 @@ fn collapse_zero_cols(buf: &[u8], m: usize, k: usize) -> Option<(Vec<u8>, usize)
             }
         }
     }
-    Some((out, new_k))
+    Some((out, new_k, live))
 }
 
 /// Try all ek! column permutations, canonicalize each, return min hash.
@@ -865,7 +820,7 @@ mod tests {
             1, 0, 4, 5,
             6, 0, 7, 8,
         ];
-        let (out, new_k) = collapse_zero_cols(&buf, 3, 4).unwrap();
+        let (out, new_k, _live) = collapse_zero_cols(&buf, 3, 4).unwrap();
         assert_eq!(new_k, 3);
         assert_eq!(out, vec![1, 2, 3, 1, 4, 5, 6, 7, 8]);
     }
@@ -883,7 +838,7 @@ mod tests {
             0, 1, 0, 2,
             0, 3, 0, 4,
         ];
-        let (out, new_k) = collapse_zero_cols(&buf, 2, 4).unwrap();
+        let (out, new_k, _live) = collapse_zero_cols(&buf, 2, 4).unwrap();
         assert_eq!(new_k, 2);
         assert_eq!(out, vec![1, 2, 3, 4]);
     }
@@ -891,34 +846,17 @@ mod tests {
     #[test]
     fn collapse_zero_cols_all_dead() {
         let buf = vec![0, 0, 0, 0, 0, 0];
-        let (out, new_k) = collapse_zero_cols(&buf, 2, 3).unwrap();
+        let (out, new_k, _live) = collapse_zero_cols(&buf, 2, 3).unwrap();
         assert_eq!(new_k, 0);
         assert!(out.is_empty());
     }
 
     #[test]
-    fn canonicalize_dead_col_merges_with_k_minus_one() {
-        // Two word sets with the same effective structure but in one, the dead
-        // column is at position 2 (k=4) and in the other it's a genuine k=3
-        // set. These should hash to the same canonical form since the dead
-        // column contributes no game-relevant information.
-        let with_dead_col = vec![
-            vec![1, 2, 0, 3],
-            vec![1, 2, 0, 4],
-            vec![5, 2, 0, 3],
-        ];
-        let no_dead_col = vec![
-            vec![1, 2, 3],
-            vec![1, 2, 4],
-            vec![5, 2, 3],
-        ];
-        assert_eq!(canonical_hash(&with_dead_col), canonical_hash(&no_dead_col));
-    }
-
-    #[test]
-    fn canonicalize_dead_col_position_invariance() {
-        // Same 3-column structure, but in one the dead col is at position 0,
-        // in the other at position 2. Both should collapse to the same hash.
+    fn canonicalize_dead_col_different_positions_differ() {
+        // Dead column at different positions must produce DIFFERENT hashes
+        // because column position matters in hangman (determines which
+        // letter appears where). Collapsing dead columns without tracking
+        // position caused wrong-EXACT entries in the cache.
         let dead_at_0 = vec![
             vec![0, 1, 2, 3],
             vec![0, 1, 2, 4],
@@ -927,7 +865,22 @@ mod tests {
             vec![1, 2, 0, 3],
             vec![1, 2, 0, 4],
         ];
-        assert_eq!(canonical_hash(&dead_at_0), canonical_hash(&dead_at_2));
+        assert_ne!(canonical_hash(&dead_at_0), canonical_hash(&dead_at_2));
+    }
+
+    #[test]
+    fn canonicalize_dead_col_same_position_same_hash() {
+        // Same dead column position → same hash (the collapse is still
+        // valid when positions match).
+        let a = vec![
+            vec![0, 1, 2, 3],
+            vec![0, 1, 2, 4],
+        ];
+        let b = vec![
+            vec![0, 1, 2, 3],
+            vec![0, 1, 2, 4],
+        ];
+        assert_eq!(canonical_hash(&a), canonical_hash(&b));
     }
 
     #[test]

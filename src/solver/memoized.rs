@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use rayon::prelude::*;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
-use super::canon::{dedup_and_hash, dedup_only};
+use super::canon::dedup_and_hash;
 use super::disk_cache::DiskCache;
 use crate::game::{LetterSet, letter_bit};
 
@@ -366,10 +366,10 @@ impl MemoizedSolver {
             0
         } else if words.len() < 2_000 {
             n_extra.clamp(0, 2)
-        } else if words.len() <= 25_000 {
-            n_extra.clamp(1, 7)
         } else {
-            n_extra.clamp(1, 2)
+            // Always use MTD(f)-tier helper count. The previous >25K
+            // pure-Lazy-SMP branch was retired (wrong-EXACT bug).
+            n_extra.clamp(1, 7)
         };
         // Debug/diagnostic override: HANGMAN_HELPERS=N.
         let n_extra = std::env::var("HANGMAN_HELPERS")
@@ -377,84 +377,51 @@ impl MemoizedSolver {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(n_extra);
 
-        let result = if words.len() <= 25_000 {
-            // MTD(f) + Lazy SMP hybrid: all threads do iterative deepening
-            // with perturbed move ordering, sharing a transposition table.
-            // Main thread uses rayon (YBWC) for internal parallelism.
-            std::thread::scope(|s| {
-                // Launch helpers with full-window search and perturbed ordering.
-                // The main thread's iterative deepening warms the TT, which
-                // helps helpers find cutoffs faster.
-                #[allow(clippy::cast_possible_truncation)]
-                let _helpers: Vec<_> = (1..=n_extra as u32)
-                    .map(|tid| {
-                        let data = Arc::clone(&data);
-                        let indices = indices.clone();
-                        s.spawn(move || {
-                            let solver = MemoizedSolverInner::new(data, tid, false);
-                            solver.solve_subset(&indices, 0, 0, u32::MAX)
-                        })
+        // MTD(f) + Lazy SMP hybrid for all sizes. The previous >25K
+        // pure-Lazy-SMP branch produced wrong-EXACT cache entries (caught
+        // by k=8 d=8 smoke test; root cause unclear, see 99d8566).
+        let result = std::thread::scope(|s| {
+            #[allow(clippy::cast_possible_truncation)]
+            let _helpers: Vec<_> = (1..=n_extra as u32)
+                .map(|tid| {
+                    let data = Arc::clone(&data);
+                    let indices = indices.clone();
+                    s.spawn(move || {
+                        let solver = MemoizedSolverInner::new(data, tid, false);
+                        solver.solve_subset(&indices, 0, 0, u32::MAX)
                     })
-                    .collect();
+                })
+                .collect();
 
-                // Main thread: MTD(f) iterative deepening with explicit alpha.
-                let solver = MemoizedSolverInner::new(Arc::clone(&data), 0, true);
-                let mut result = 0;
-                let mut lo = 0u32;
-                for (iter, target) in (0..26u32).enumerate() {
-                    #[allow(clippy::cast_possible_truncation)]
-                    data.mtd_iteration.store(iter as u32, Ordering::Relaxed);
-                    let iter_start = Instant::now();
-                    result = solver.solve_subset(&indices, 0, lo, target + 1);
-                    let iter_secs = iter_start.elapsed().as_secs_f64();
-                    if iter_secs > 0.01 {
-                        data.iter_durations.lock().unwrap().push(iter_secs);
-                    }
-                    if result <= target {
-                        break;
-                    }
-                    lo = result;
-                }
-
-                // MTD(f) used narrow windows, so many TT entries are bounds
-                // rather than EXACT. Do one final full-window pass to convert
-                // them to EXACT (needed for disk cache persistence). The TT is
-                // warm from MTD(f), so this is very fast.
-                solver.solve_subset(&indices, 0, 0, result + 1);
-
-                // Signal helpers to stop and wait for them.
-                data.cancelled.store(true, Ordering::Relaxed);
-                result
-            })
-        } else {
-            // Pure Lazy SMP: primary thread uses rayon (YBWC) for internal
-            // parallelism; extra sequential threads explore with perturbed
-            // orderings, sharing the TT for mutual pruning.
-            std::thread::scope(|s| {
+            // Main thread: MTD(f) iterative deepening with explicit alpha.
+            let solver = MemoizedSolverInner::new(Arc::clone(&data), 0, true);
+            let mut result = 0;
+            let mut lo = 0u32;
+            for (iter, target) in (0..26u32).enumerate() {
                 #[allow(clippy::cast_possible_truncation)]
-                let handles: Vec<_> = (1..=n_extra as u32)
-                    .map(|tid| {
-                        let data = Arc::clone(&data);
-                        let indices = indices.clone();
-                        s.spawn(move || {
-                            let solver = MemoizedSolverInner::new(data, tid, false);
-                            solver.solve_subset(&indices, 0, 0, u32::MAX)
-                        })
-                    })
-                    .collect();
-
-                let main_result = {
-                    let solver = MemoizedSolverInner::new(Arc::clone(&data), 0, true);
-                    solver.solve_subset(&indices, 0, 0, u32::MAX)
-                };
-
-                let mut best = main_result;
-                for h in handles {
-                    best = best.min(h.join().unwrap());
+                data.mtd_iteration.store(iter as u32, Ordering::Relaxed);
+                let iter_start = Instant::now();
+                result = solver.solve_subset(&indices, 0, lo, target + 1);
+                let iter_secs = iter_start.elapsed().as_secs_f64();
+                if iter_secs > 0.01 {
+                    data.iter_durations.lock().unwrap().push(iter_secs);
                 }
-                best
-            })
-        };
+                if result <= target {
+                    break;
+                }
+                lo = result;
+            }
+
+            // MTD(f) used narrow windows, so many TT entries are bounds
+            // rather than EXACT. Do one final full-window pass to convert
+            // them to EXACT (needed for disk cache persistence). The TT is
+            // warm from MTD(f), so this is very fast.
+            solver.solve_subset(&indices, 0, 0, result + 1);
+
+            // Signal helpers to stop and wait for them.
+            data.cancelled.store(true, Ordering::Relaxed);
+            result
+        });
 
         // Transfer instrumentation to outer solver.
         self.hash_calls
@@ -540,10 +507,12 @@ impl MemoizedSolver {
             0
         } else if n_words < 2_000 {
             n_extra.clamp(0, 2)
-        } else if n_words <= 25_000 {
-            n_extra.clamp(1, 7)
         } else {
-            n_extra.clamp(1, 2)
+            // Always use the MTD(f) helper count (was: clamp(1,2) for >25K via
+            // pure Lazy SMP). The pure Lazy SMP branch produced wrong-EXACT
+            // entries on k=8 d=8 — smoke test caught it, root cause unclear.
+            // Forcing all sizes through the MTD(f) hybrid path avoids it.
+            n_extra.clamp(1, 7)
         };
         // Diagnostic override: HANGMAN_HELPERS=N.
         let n_extra = std::env::var("HANGMAN_HELPERS")
@@ -551,69 +520,46 @@ impl MemoizedSolver {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(n_extra);
 
-        let result = if n_words <= 25_000 {
-            std::thread::scope(|s| {
-                #[allow(clippy::cast_possible_truncation)]
-                let _helpers: Vec<_> = (1..=n_extra as u32)
-                    .map(|tid| {
-                        let data = Arc::clone(&data);
-                        let indices = indices.clone();
-                        s.spawn(move || {
-                            let solver = MemoizedSolverInner::new(data, tid, false);
-                            solver.solve_subset(&indices, masked, 0, u32::MAX)
-                        })
+        // MTD(f) hybrid for all sizes. The previous >25K pure Lazy SMP
+        // branch produced wrong-EXACT entries (k=8 d=8 smoke caught it,
+        // root cause unclear — see 99d8566). The MTD(f) path is verified
+        // clean on k=4 d=16 and k=5 d=15 in this batch.
+        let result = std::thread::scope(|s| {
+            #[allow(clippy::cast_possible_truncation)]
+            let _helpers: Vec<_> = (1..=n_extra as u32)
+                .map(|tid| {
+                    let data = Arc::clone(&data);
+                    let indices = indices.clone();
+                    s.spawn(move || {
+                        let solver = MemoizedSolverInner::new(data, tid, false);
+                        solver.solve_subset(&indices, masked, 0, u32::MAX)
                     })
-                    .collect();
+                })
+                .collect();
 
-                let solver = MemoizedSolverInner::new(Arc::clone(&data), 0, true);
-                let mut result = 0;
-                let mut lo = 0u32;
-                for (iter, target) in (0..26u32).enumerate() {
-                    #[allow(clippy::cast_possible_truncation)]
-                    data.mtd_iteration.store(iter as u32, Ordering::Relaxed);
-                    let iter_start = Instant::now();
-                    result = solver.solve_subset(&indices, masked, lo, target + 1);
-                    let iter_secs = iter_start.elapsed().as_secs_f64();
-                    if iter_secs > 0.01 {
-                        data.iter_durations.lock().unwrap().push(iter_secs);
-                    }
-                    if result <= target {
-                        break;
-                    }
-                    lo = result;
-                }
-
-                solver.solve_subset(&indices, masked, 0, result + 1);
-
-                data.cancelled.store(true, Ordering::Relaxed);
-                result
-            })
-        } else {
-            std::thread::scope(|s| {
+            let solver = MemoizedSolverInner::new(Arc::clone(&data), 0, true);
+            let mut result = 0;
+            let mut lo = 0u32;
+            for (iter, target) in (0..26u32).enumerate() {
                 #[allow(clippy::cast_possible_truncation)]
-                let handles: Vec<_> = (1..=n_extra as u32)
-                    .map(|tid| {
-                        let data = Arc::clone(&data);
-                        let indices = indices.clone();
-                        s.spawn(move || {
-                            let solver = MemoizedSolverInner::new(data, tid, false);
-                            solver.solve_subset(&indices, masked, 0, u32::MAX)
-                        })
-                    })
-                    .collect();
-
-                let main_result = {
-                    let solver = MemoizedSolverInner::new(Arc::clone(&data), 0, true);
-                    solver.solve_subset(&indices, masked, 0, u32::MAX)
-                };
-
-                let mut best = main_result;
-                for h in handles {
-                    best = best.min(h.join().unwrap());
+                data.mtd_iteration.store(iter as u32, Ordering::Relaxed);
+                let iter_start = Instant::now();
+                result = solver.solve_subset(&indices, masked, lo, target + 1);
+                let iter_secs = iter_start.elapsed().as_secs_f64();
+                if iter_secs > 0.01 {
+                    data.iter_durations.lock().unwrap().push(iter_secs);
                 }
-                best
-            })
-        };
+                if result <= target {
+                    break;
+                }
+                lo = result;
+            }
+
+            solver.solve_subset(&indices, masked, 0, result + 1);
+
+            data.cancelled.store(true, Ordering::Relaxed);
+            result
+        });
 
         // Force-store EXACT entry for the root position. The MTD(f)
         // verification pass may fail to produce EXACT because TT bounds
@@ -646,10 +592,8 @@ impl MemoizedSolver {
             debug_assert!(
                 data.cache
                     .get(&root_key)
-                    .map(|e| cache_unpack(*e).2 == BOUND_EXACT)
-                    .unwrap_or(false),
-                "force-store EXACT vanished from data.cache for root_key={:032x}",
-                root_key
+                    .is_some_and(|e| cache_unpack(*e).2 == BOUND_EXACT),
+                "force-store EXACT vanished from data.cache for root_key={root_key:032x}",
             );
         }
 
@@ -832,9 +776,6 @@ struct SolverData {
     /// present in the word. Used for fast `present_letters` computation.
     word_letters: Vec<u32>,
     cache: DashMap<u128, u32>,
-    /// Maps cheap index-based hash → canonical key. Avoids redundant
-    /// `dedup_and_hash` calls (the main bottleneck for small word sets).
-    key_cache: DashMap<u64, u128>,
     hash_calls: AtomicU64,
     cache_hits: AtomicU64,
     /// Frequency rank: `freq_rank[letter_idx]` = rank (0 = most frequent).
@@ -844,10 +785,10 @@ struct SolverData {
     /// (best move or cutoff-causing) across the search. Used for dynamic
     /// move ordering — letters with high history scores are tried earlier.
     history: [AtomicU32; 26],
-    /// Cross-thread cancellation flag for the precompute paths (solve,
-    /// solve_position_smp, solve_bounded), where SMP helpers share a single
-    /// SolverData. Serving paths use a per-call `local_cancelled` token in
-    /// MemoizedSolverInner instead, so concurrent calls don't interfere.
+    /// Cross-thread cancellation flag for the precompute paths (`solve`,
+    /// `solve_position_smp`, `solve_bounded`), where SMP helpers share a single
+    /// `SolverData`. Serving paths use a per-call `local_cancelled` token in
+    /// `MemoizedSolverInner` instead, so concurrent calls don't interfere.
     cancelled: AtomicBool,
     /// Progress stack for ETA estimation. Only written by the main OS thread,
     /// read by an external reporter. The Mutex is uncontested during solving
@@ -907,7 +848,6 @@ impl SolverData {
             pos_masks,
             word_letters,
             cache: DashMap::new(),
-            key_cache: DashMap::new(),
             hash_calls: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             freq_rank,
@@ -1480,22 +1420,6 @@ impl MemoizedSolverInner {
     }
 
     /// Compute a cheap order-independent hash of (indices, masked) for the
-    /// key cache. Uses a commutative mixing function so that different
-    /// orderings of the same index set produce the same hash.
-    fn fast_index_key(indices: &[usize], masked: LetterSet) -> u64 {
-        let mut h = 0u64;
-        let mut xor = 0u64;
-        for &idx in indices {
-            let mix = (idx as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
-            h = h.wrapping_add(mix);
-            xor ^= mix;
-        }
-        h = h.wrapping_add(xor.rotate_left(17));
-        h ^= u64::from(masked).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        h ^= (indices.len() as u64) << 48;
-        h ^ (h >> 33)
-    }
-
     #[allow(clippy::too_many_lines)]
     fn solve_subset(&self, indices: &[usize], masked: LetterSet, alpha: u32, beta: u32) -> u32 {
         if indices.len() <= 1 || beta == 0 {
@@ -1548,26 +1472,12 @@ impl MemoizedSolverInner {
             return beta;
         }
 
-        // Fast key cache: map (indices, masked) → canonical_key. On cache
-        // hit, check TT immediately — skip expensive dedup_and_hash entirely
-        // for TT hits. Only recompute on TT miss.
-        let fast_key = Self::fast_index_key(indices, masked);
-        let (indices, cache_key) = if let Some(entry) = self.data.key_cache.get(&fast_key) {
-            let canon_key = *entry;
-            drop(entry);
-            self.data.hash_calls.fetch_add(1, Ordering::Relaxed);
-            // Check TT — most visits are hits, avoiding dedup_and_hash entirely.
-            if let CacheLookup::Hit(val) = self.cache_lookup(canon_key, alpha, beta) {
-                return val;
-            }
-            // TT miss: only need deduped indices (skip canonicalization).
-            let deduped = dedup_only(&self.data.words, indices, masked);
-            (deduped, canon_key)
-        } else {
-            let (deduped, canon_key) = dedup_and_hash(&self.data.words, indices, masked);
-            self.data.key_cache.insert(fast_key, canon_key);
-            (deduped, canon_key)
-        };
+        // Canonicalize and hash. The earlier u64 fast-key cache shortcut
+        // was removed: birthday collisions in the 64-bit fast key reused
+        // canon_keys across structurally-distinct (indices, masked) tuples,
+        // poisoning the TT and producing wrong EXACT entries on disk for
+        // long runs (k=3 d=17 reproduced the bug).
+        let (indices, cache_key) = dedup_and_hash(&self.data.words, indices, masked);
 
         if indices.len() <= 1 {
             return 0;
@@ -1857,7 +1767,7 @@ impl MemoizedSolverInner {
             }
 
             // Fast inline resolution for tiny partitions (avoids solve_subset
-            // overhead: analyze_required, fast_index_key, dedup_and_hash, TT).
+            // overhead: analyze_required, dedup_and_hash, TT).
             if subset.len() <= 1 {
                 worst = worst.max(miss_cost);
                 established = true;

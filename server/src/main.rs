@@ -152,6 +152,9 @@ struct AppState {
 #[derive(Deserialize)]
 struct NewGameQuery {
     length: usize,
+    /// "hardest" (default) → minimax−1 misses; "hard" → minimax misses
+    /// (one extra, the smallest budget that's survivable with optimal play).
+    difficulty: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -250,9 +253,13 @@ async fn handle_new_game(
         return Err(err(StatusCode::BAD_REQUEST, "no words of that length"));
     }
 
+    let extra = match params.difficulty.as_deref() {
+        Some("hard") => 1,
+        _ => 0,
+    };
     let guesses_allowed = length_data
         .minimax_value
-        .map(|v| v.saturating_sub(1))
+        .map(|v| v.saturating_sub(1).saturating_add(extra))
         .unwrap_or(6);
 
     let game_id = Uuid::new_v4().to_string();
@@ -279,13 +286,15 @@ async fn handle_new_game(
 
     state.sessions.insert(game_id.clone(), session);
 
+    let difficulty_label = if extra == 0 { "hardest" } else { "hard" };
     info!(
-        "GAME new id={} k={} dict={} minimax={:?} budget={}",
+        "GAME new id={} k={} dict={} minimax={:?} budget={} difficulty={}",
         game_id,
         params.length,
         length_data.words.len(),
         length_data.minimax_value,
         guesses_allowed,
+        difficulty_label,
     );
 
     Ok(Json(NewGameResponse {

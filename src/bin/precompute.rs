@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
@@ -410,6 +410,10 @@ fn main() -> Result<()> {
         let mut batch: Vec<Task> = Vec::with_capacity(batch_size);
         let mut position_index: usize = 0;
         let mut should_abort = false;
+        // Time-gated progress log so silent runs (e.g., verify pass on
+        // already-EXACT cache, where every position skips and no [stats]
+        // line ever fires) still produce visible heartbeat output.
+        let mut last_progress_log = Instant::now();
 
         // Helper: drain the current batch through the worker pool.
         let process_batch = |batch: &mut Vec<Task>| {
@@ -532,6 +536,19 @@ fn main() -> Result<()> {
                         rbe_pct,
                         stats.rejected_other,
                     );
+                }
+                // Heartbeat: enumeration progress every 60s. Distinct from
+                // [stats] so verify-style runs (zero saves) still log.
+                if last_progress_log.elapsed() >= Duration::from_secs(60) {
+                    println!(
+                        "  [enum] pos={} solved={} skipped={} too_large={} elapsed={:.1?}",
+                        position_index,
+                        solved.load(Ordering::Relaxed),
+                        skipped.load(Ordering::Relaxed),
+                        too_large.load(Ordering::Relaxed),
+                        wall_start.elapsed(),
+                    );
+                    last_progress_log = Instant::now();
                 }
             }
 

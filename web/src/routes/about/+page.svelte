@@ -14,19 +14,21 @@
 			least one dictionary word remains consistent with all previous responses.
 		</p>
 		<p>
-			The referee in Dead Letters plays <strong>optimally</strong>. Every response is the
-			mathematically worst-case move, computed by a minimax solver that has analyzed
-			the full game tree.
+			The referee in Dead Letters plays <strong>optimally</strong> for every position
+			it has solved. For positions the precompute didn't reach, the server runs the
+			minimax solver live with a 10&thinsp;s budget &mdash; in practice that's only the
+			deep edge cases reachable through deliberately bad play.
 		</p>
 	</section>
 
 	<section class="about-section">
 		<h2>Can I actually win?</h2>
 		<p>
-			No. The game allows you one fewer miss than needed to win, so
-			even with perfect play, the referee will always hang you. The table below
-			shows the minimum misses needed to win for each word length
-			&mdash; you get one fewer than that.
+			It depends on which difficulty you pick. The table below shows the minimum
+			misses needed to win for each word length. On <strong>Hardest</strong>,
+			you get one fewer than that &mdash; even with perfect play the referee
+			hangs you by one. On <strong>Hard</strong>, you get exactly that many
+			&mdash; survivable, but only with optimal play.
 		</p>
 
 		<div class="results-table-wrap">
@@ -35,24 +37,51 @@
 					<tr><th>Length</th><th>Words</th><th>Misses to Win</th></tr>
 				</thead>
 				<tbody>
-					<tr><td>3</td><td>972</td><td>18</td></tr>
-					<tr><td>4</td><td>3,903</td><td>15</td></tr>
-					<tr><td>5</td><td>8,636</td><td>14</td></tr>
-					<tr><td>6</td><td>15,232</td><td>13</td></tr>
-					<tr><td>7</td><td>23,109</td><td>12</td></tr>
-					<tr><td>8</td><td>28,420</td><td>9</td></tr>
-					<tr><td>9</td><td>24,873</td><td>7</td></tr>
-					<tr><td>10</td><td>20,300</td><td>6</td></tr>
-					<tr><td>11</td><td>15,504</td><td>7</td></tr>
-					<tr><td>12</td><td>11,357</td><td>5</td></tr>
-					<tr><td>13</td><td>7,827</td><td>5</td></tr>
-					<tr><td>14</td><td>5,127</td><td>4</td></tr>
+					<tr><td>3</td><td>972</td><td>17</td></tr>
+					<tr><td>4</td><td>3,903</td><td>14</td></tr>
+					<tr><td>5</td><td>8,636</td><td>13</td></tr>
+					<tr><td>6</td><td>15,232</td><td>12</td></tr>
+					<tr><td>7</td><td>23,109</td><td>11</td></tr>
+					<tr><td>8</td><td>28,420</td><td>8</td></tr>
+					<tr><td>9</td><td>24,873</td><td>6</td></tr>
+					<tr><td>10</td><td>20,300</td><td>5</td></tr>
+					<tr><td>11</td><td>15,504</td><td>6</td></tr>
+					<tr><td>12</td><td>11,357</td><td>4</td></tr>
+					<tr><td>13</td><td>7,827</td><td>4</td></tr>
+					<tr><td>14</td><td>5,127</td><td>3</td></tr>
 				</tbody>
 			</table>
 		</div>
 		<p class="table-note">
-			Longer words are easier. At 20+ letters, only 2 misses are needed.
+			Longer words are easier. At 20+ letters, only 0&ndash;1 misses are needed.
 		</p>
+	</section>
+
+	<section class="about-section">
+		<h2>What's been solved?</h2>
+		<p>
+			Game theorists distinguish three strengths of "solving" a game.
+			Dead Letters has the first two; the third we've deliberately skipped.
+		</p>
+		<ul>
+			<li><strong>Ultra-weak</strong> &mdash; the table above. We know who wins
+				under perfect play (the referee, always) and by what margin (the misses
+				needed). The weakest claim and the easiest to compute.</li>
+			<li><strong>Weak</strong> &mdash; an algorithm that produces optimal moves
+				<em>from the starting position</em>, with both sides playing optimally
+				thereafter. When you press the hint button you get the provably best letter;
+				the referee then picks adversarially; you ask for the next hint; and so on.
+				The 4&thinsp;billion-plus precomputed positions in the disk cache, plus a
+				live minimax solver for anything they don't cover, mean the hint stays
+				correct even if you've ignored earlier hints &mdash; as long as the
+				<em>referee</em> has played its forced adversarial line, which it always
+				does.</li>
+			<li><strong>Strong</strong> &mdash; optimal moves from any reachable position
+				including ones where the <em>referee</em> made a sub-optimal choice along
+				the way. Dead Letters' game mechanics don't let the referee misplay, so
+				those branches are never reached in practice and we don't bother solving
+				them. Skipping that work is what makes the precompute tractable.</li>
+		</ul>
 	</section>
 
 	<section class="about-section">

@@ -55,7 +55,7 @@ export function createGameState() {
 	let _mockWord = $state('');
 	let _started = $state(false);
 
-	async function newGame(wordLength: number) {
+	async function newGame(wordLength: number, difficulty: 'hard' | 'hardest' = 'hardest') {
 		cancelHint();
 		loading = true;
 		error = null;
@@ -66,7 +66,8 @@ export function createGameState() {
 
 		if (MOCK) {
 			_mockWord = pickMockWord(wordLength);
-			const guesses = (MOCK_MINIMAX[wordLength] ?? 8) - 1;
+			const base = (MOCK_MINIMAX[wordLength] ?? 8) - 1;
+			const guesses = difficulty === 'hard' ? base + 1 : base;
 			state = {
 				gameId: 'mock-' + Math.random().toString(36).slice(2),
 				wordLength,
@@ -87,7 +88,7 @@ export function createGameState() {
 		}
 
 		try {
-			const res = await fetch(`${API_BASE}/new?length=${wordLength}`);
+			const res = await fetch(`${API_BASE}/new?length=${wordLength}&difficulty=${difficulty}`);
 			if (!res.ok) throw new Error(await res.text());
 			const data = await res.json();
 			state = {

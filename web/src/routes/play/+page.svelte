@@ -32,13 +32,18 @@
 		return Math.floor(Math.random() * 12) + 3; // 3–14
 	}
 
+	function getDifficulty(): 'hard' | 'hardest' {
+		const stored = localStorage.getItem('difficulty');
+		return stored === 'hard' ? 'hard' : 'hardest';
+	}
+
 	// Load dictionary and start game on mount
 	$effect(() => {
 		if (!game.started && !game.loading) {
 			loadDictionary().then(words => {
 				allWords = words;
 			});
-			game.newGame(getLength());
+			game.newGame(getLength(), getDifficulty());
 		}
 	});
 
@@ -48,7 +53,7 @@
 
 	function playAgain() {
 		gamesPlayed++;
-		game.newGame(getLength());
+		game.newGame(getLength(), getDifficulty());
 	}
 </script>
 

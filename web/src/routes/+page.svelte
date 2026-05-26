@@ -1,5 +1,19 @@
 <script lang="ts">
 	import Gallows from '$lib/components/Gallows.svelte';
+
+	let difficulty = $state<'hard' | 'hardest'>('hardest');
+
+	$effect(() => {
+		const stored = localStorage.getItem('difficulty');
+		if (stored === 'hard' || stored === 'hardest') {
+			difficulty = stored;
+		}
+	});
+
+	function setDifficulty(d: 'hard' | 'hardest') {
+		difficulty = d;
+		localStorage.setItem('difficulty', d);
+	}
 </script>
 
 <div class="landing">
@@ -18,6 +32,38 @@
 
 		<p class="tagline">The hardest game of hangman you'll ever play.</p>
 
+		<div class="maintenance-banner" role="status">
+			<strong>Under maintenance.</strong>
+			Solver caches are being rebuilt to fix corrupt entries.
+			Gameplay may be slow or unavailable until this completes.
+		</div>
+
+		<div class="difficulty-picker" role="radiogroup" aria-label="Difficulty">
+			<button
+				type="button"
+				class="diff-btn"
+				class:active={difficulty === 'hard'}
+				role="radio"
+				aria-checked={difficulty === 'hard'}
+				onclick={() => setDifficulty('hard')}
+			>Hard</button>
+			<button
+				type="button"
+				class="diff-btn"
+				class:active={difficulty === 'hardest'}
+				role="radio"
+				aria-checked={difficulty === 'hardest'}
+				onclick={() => setDifficulty('hardest')}
+			>Hardest</button>
+		</div>
+		<p class="diff-caption">
+			{#if difficulty === 'hardest'}
+				Unwinnable. Optimal play hangs you by one miss.
+			{:else}
+				Survivable. Optimal play just barely escapes.
+			{/if}
+		</p>
+
 		<a href="/play" class="play-btn">
 			<span class="play-text">PLAY</span>
 			<span class="play-glow"></span>
@@ -25,7 +71,6 @@
 	</main>
 
 	<footer class="landing-footer">
-		<p class="footer-whisper">You will not win.</p>
 		<a href="/about" class="about-link">What is this?</a>
 	</footer>
 </div>
@@ -96,6 +141,67 @@
 		max-width: 400px;
 	}
 
+	.difficulty-picker {
+		display: inline-flex;
+		border: 1px solid var(--text-ghost, #3d3647);
+		border-radius: 4px;
+		overflow: hidden;
+		margin-top: -0.5rem;
+	}
+
+	.diff-btn {
+		font-family: var(--font-display, 'Creepster', cursive);
+		font-size: 1rem;
+		letter-spacing: 0.08em;
+		padding: 0.45rem 1.4rem;
+		background: transparent;
+		color: var(--text-dim, #6b6575);
+		border: none;
+		cursor: pointer;
+		transition: background 0.15s, color 0.15s;
+	}
+
+	.diff-btn:not(:last-child) {
+		border-right: 1px solid var(--text-ghost, #3d3647);
+	}
+
+	.diff-btn:hover {
+		color: var(--bone, #e8dcc8);
+	}
+
+	.diff-btn.active {
+		background: var(--blood, #8b2233);
+		color: var(--bone, #e8dcc8);
+	}
+
+	.maintenance-banner {
+		font-family: var(--font-body, Georgia, serif);
+		font-size: 0.9rem;
+		line-height: 1.5;
+		color: var(--bone, #e8dcc8);
+		background: rgba(139, 34, 51, 0.18);
+		border: 1px solid var(--blood, #8b2233);
+		border-radius: 4px;
+		padding: 0.75rem 1rem;
+		max-width: 440px;
+		text-align: center;
+		margin-top: -0.5rem;
+	}
+
+	.maintenance-banner strong {
+		color: var(--blood-bright, #c0392b);
+	}
+
+	.diff-caption {
+		font-family: var(--font-body);
+		font-size: 0.85rem;
+		font-style: italic;
+		color: var(--text-ghost, #3d3647);
+		margin-top: -0.75rem;
+		max-width: 400px;
+		min-height: 1.2em;
+	}
+
 	.play-btn {
 		position: relative;
 		display: inline-block;
@@ -143,17 +249,8 @@
 		z-index: 1;
 	}
 
-	.footer-whisper {
-		font-family: var(--font-body);
-		font-style: italic;
-		font-size: 0.9rem;
-		color: var(--text-ghost);
-		animation: pulse 4s ease-in-out infinite;
-	}
-
 	.about-link {
 		display: block;
-		margin-top: 0.75rem;
 		font-family: var(--font-body);
 		font-size: 0.85rem;
 		color: var(--text-ghost);
@@ -192,11 +289,6 @@
 	@keyframes shimmer {
 		0%, 100% { transform: translateX(-100%); }
 		50% { transform: translateX(100%); }
-	}
-
-	@keyframes pulse {
-		0%, 100% { opacity: 0.3; }
-		50% { opacity: 0.6; }
 	}
 
 	@keyframes drift {
