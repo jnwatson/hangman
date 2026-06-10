@@ -415,22 +415,23 @@ fn canonicalize_sorted_rows(buf: &mut [u8], m: usize, k: usize) -> u128 {
         relabel_flat(&mut buf);
     }
 
-    // Mix the dead-column mask into the hash so that states with the same
+    // Mix the live-column mask into the hash so that states with the same
     // non-zero content but different live-column positions get distinct keys.
-    let content_hash = hash_flat(&buf);
-    if col_mask == u64::MAX {
-        content_hash
-    } else {
-        let mut hasher = std::hash::DefaultHasher::new();
-        content_hash.hash(&mut hasher);
-        col_mask.hash(&mut hasher);
-        let h1 = hasher.finish();
-        let mut hasher2 = std::hash::DefaultHasher::new();
-        h1.hash(&mut hasher2);
-        col_mask.hash(&mut hasher2);
-        let h2 = hasher2.finish();
-        u128::from(h1) | (u128::from(h2) << 64)
-    }
+    //
+    // The mask is appended to the buffer and fed through `hash_flat` rather
+    // than mixed in post-hoc. `hash_flat`'s two passes both consume the full
+    // data, so a key collision requires a full 128-bit collision. A post-hoc
+    // mix that folded only the 64-bit `h1` of the content hash with the mask
+    // would make the entire u128 a function of a single 64-bit value,
+    // collapsing collision resistance to 64 bits for every dead-column state
+    // (the majority of deep positions) — the same birthday-collision class
+    // that the `fast_index_key` removal was meant to eliminate.
+    //
+    // `u64::MAX` is the all-live sentinel; a real collapse always clears at
+    // least one of the original k (<= 64) column bits, so it can never equal
+    // the sentinel, keeping the two cases unambiguous under one hash domain.
+    buf.extend_from_slice(&col_mask.to_le_bytes());
+    hash_flat(&buf)
 }
 
 /// Check for all-zero columns in a row-major m×k buffer. Returns `None` if
@@ -870,15 +871,18 @@ mod tests {
 
     #[test]
     fn canonicalize_dead_col_same_position_same_hash() {
-        // Same dead column position → same hash (the collapse is still
-        // valid when positions match).
+        // Same dead-column position but different surface form (letter
+        // relabeling) → same hash: the collapse + relabel must still merge
+        // isomorphic states when their live-column positions match. `b` is
+        // `a` with its live letters renamed (1,2,3,4 → 5,6,7,8); both have a
+        // dead column at position 0 and must canonicalize together.
         let a = vec![
             vec![0, 1, 2, 3],
             vec![0, 1, 2, 4],
         ];
         let b = vec![
-            vec![0, 1, 2, 3],
-            vec![0, 1, 2, 4],
+            vec![0, 5, 6, 7],
+            vec![0, 5, 6, 8],
         ];
         assert_eq!(canonical_hash(&a), canonical_hash(&b));
     }
