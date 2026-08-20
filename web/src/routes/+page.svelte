@@ -32,12 +32,6 @@
 
 		<p class="tagline">The hardest game of hangman you'll ever play.</p>
 
-		<div class="maintenance-banner" role="status">
-			<strong>Under maintenance.</strong>
-			Solver caches are being rebuilt to fix corrupt entries.
-			Gameplay may be slow or unavailable until this completes.
-		</div>
-
 		<div class="difficulty-picker" role="radiogroup" aria-label="Difficulty">
 			<button
 				type="button"
@@ -172,24 +166,6 @@
 	.diff-btn.active {
 		background: var(--blood, #8b2233);
 		color: var(--bone, #e8dcc8);
-	}
-
-	.maintenance-banner {
-		font-family: var(--font-body, Georgia, serif);
-		font-size: 0.9rem;
-		line-height: 1.5;
-		color: var(--bone, #e8dcc8);
-		background: rgba(139, 34, 51, 0.18);
-		border: 1px solid var(--blood, #8b2233);
-		border-radius: 4px;
-		padding: 0.75rem 1rem;
-		max-width: 440px;
-		text-align: center;
-		margin-top: -0.5rem;
-	}
-
-	.maintenance-banner strong {
-		color: var(--blood-bright, #c0392b);
 	}
 
 	.diff-caption {
